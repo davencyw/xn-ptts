@@ -198,6 +198,8 @@ fn row(label: &str, unit: &str, prec: usize, st: &Stats) {
 struct Bench<'a>(&'a Args);
 
 impl xn::WithQ for Bench<'_> {
+    type Output = ();
+
     fn run<Q: BackendQ>(self, dev: Q::B) -> xn::Result<()> {
         self.bench::<Q>(dev).map_err(|e| xn::Error::msg(format!("{e:?}")))
     }
