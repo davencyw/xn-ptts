@@ -5,7 +5,8 @@ mod model_helpers;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use model_helpers::{SpTokenizer, max_frames_for};
+use model_helpers::max_frames_for;
+use ptts::tok::Tok;
 use ptts::tts_model::{
     MimiEnc, TTSConfig, TTSModel, prepare_text_prompt, split_into_best_sentences,
 };
@@ -50,6 +51,11 @@ struct Args {
     #[arg(long)]
     quant: Option<String>,
 
+    /// Path to a `tokenizer.json`, as produced by `scripts/convert-tokenizer.py`. Defaults to the
+    /// one shipped next to the weights.
+    #[arg(long)]
+    tokenizer: Option<std::path::PathBuf>,
+
     #[arg(long)]
     chrome_tracing: bool,
 
@@ -87,7 +93,12 @@ fn download_files(voice: &str) -> Result<(std::path::PathBuf, std::path::PathBuf
     let model_path = repo.get("tts_b6369a24.safetensors").context("model weights not found")?;
     tracing::info!(?model_path, "model weights downloaded");
 
-    let tokenizer_path = repo.get("tokenizer.model").context("tokenizer not found")?;
+    // The repo ships a SentencePiece `tokenizer.model`, which needs converting once; `--tokenizer`
+    // then points at the result.
+    let tokenizer_path = repo.get("tokenizer.json").context(
+        "no tokenizer.json in the repo: convert its tokenizer.model with \
+         `uv run scripts/convert-tokenizer.py` and pass the result with --tokenizer",
+    )?;
     tracing::info!(?tokenizer_path, "tokenizer downloaded");
 
     let voice = if VOICES.contains(&voice) {
@@ -302,7 +313,7 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
                 None => parent.join("model.safetensors"),
                 Some(p) => std::path::PathBuf::from_str(p)?,
             };
-            let tokenizer_path = parent.join("tokenizer.model");
+            let tokenizer_path = parent.join("tokenizer.json");
             tracing::info!(?config, "using local config");
             let config: ptts::tts_model::TTSConfig =
                 serde_json::from_str(&std::fs::read_to_string(config)?)?;
@@ -333,7 +344,7 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
         }
     };
 
-    let tokenizer = SpTokenizer::open(&tokenizer_path)?;
+    let tokenizer = Tok::open(args.tokenizer.as_deref().unwrap_or(&tokenizer_path))?;
     let text = match args.lang.as_deref() {
         None => std::borrow::Cow::Borrowed(args.text.as_str()),
         Some(lang) => {
