@@ -75,6 +75,10 @@ struct Args {
     /// Off by default so measurements stay comparable with runs that predate the flag.
     #[arg(long)]
     lang: Option<String>,
+
+    /// Frames of Mimi decoder context -- the vocoder window.
+    #[arg(long, default_value_t = MIMI_CONTEXT_SIZE)]
+    mimi_context: usize,
 }
 
 struct StdRng {
@@ -104,6 +108,10 @@ struct Run {
     ttfa: Duration,
     /// Per frame, sampling plus Mimi decoding.
     frames: Vec<Duration>,
+    /// The sampling half of each frame.
+    sample_t: Vec<Duration>,
+    /// The Mimi decode half of each frame.
+    decode_t: Vec<Duration>,
     total: Duration,
     samples: usize,
 }
@@ -119,6 +127,8 @@ fn one<Q: BackendQ>(
     let ldim = model.flow_lm.ldim;
     let mut rng = StdRng::new(args.temperature, args.seed)?;
     let mut frames = Vec::new();
+    let mut sample_t = Vec::new();
+    let mut decode_t = Vec::new();
     let mut ttfa = None;
     let mut samples = 0usize;
     let start = Instant::now();
@@ -126,7 +136,7 @@ fn one<Q: BackendQ>(
     for (tokens, frames_after_eos) in chunks.iter() {
         let mut state = base_state.clone();
         model.prompt_text(&mut state, tokens)?;
-        let mut mimi_state = model.init_mimi_state(1, MIMI_CONTEXT_SIZE)?;
+        let mut mimi_state = model.init_mimi_state(1, args.mimi_context)?;
 
         // BOS marker: an all-NaN latent.
         let nan: Tensor<f32, Q::B> = Tensor::from_vec(vec![f32::NAN; ldim], (1, 1, ldim), dev)?;
@@ -136,10 +146,14 @@ fn one<Q: BackendQ>(
         for _ in 0..max_frames_for(tokens.len()) {
             let frame_start = Instant::now();
             let (next_latent, is_eos) = model.generate_step(&mut state, &prev_latent, &mut rng)?;
+            let sampled = Instant::now();
             // Decoding on this thread rather than overlapped, so the measurement attributes
             // sampling and decoding to the frame that caused them.
             let pcm = model.decode_latent(&next_latent, &mut mimi_state)?.to_vec()?;
-            frames.push(frame_start.elapsed());
+            let done = Instant::now();
+            sample_t.push(sampled - frame_start);
+            decode_t.push(done - sampled);
+            frames.push(done - frame_start);
             if !pcm.is_empty() {
                 ttfa.get_or_insert_with(|| start.elapsed());
                 samples += pcm.len();
@@ -160,7 +174,7 @@ fn one<Q: BackendQ>(
 
     let total = start.elapsed();
     let ttfa = ttfa.context("no audio produced")?;
-    Ok(Run { ttfa, frames, total, samples })
+    Ok(Run { ttfa, frames, sample_t, decode_t, total, samples })
 }
 
 fn ms(d: Duration) -> f64 {
@@ -291,6 +305,10 @@ impl Bench<'_> {
         // Pooled across iterations: per-frame variation matters more than which run it came
         // from, and one run has too few frames for a stable tail.
         let frames: Vec<f64> = runs.iter().flat_map(|r| r.frames.iter().copied().map(ms)).collect();
+        let sample_t: Vec<f64> =
+            runs.iter().flat_map(|r| r.sample_t.iter().copied().map(ms)).collect();
+        let decode_t: Vec<f64> =
+            runs.iter().flat_map(|r| r.decode_t.iter().copied().map(ms)).collect();
         // Audio produced per unit of wall time, so higher is faster than realtime.
         let rtfs: Vec<f64> = runs.iter().map(|r| audio_ms(r) / ms(r.total)).collect();
 
@@ -313,6 +331,8 @@ impl Bench<'_> {
             ("total generate", "ms", 2, &totals),
             ("time to first audio", "ms", 2, &ttfas),
             ("per-frame", "ms", 3, &frames),
+            ("  flow_lm sample", "ms", 3, &sample_t),
+            ("  mimi decode", "ms", 3, &decode_t),
             ("rtf (higher is better)", "x realtime", 2, &rtfs),
         ] {
             row(label, unit, prec, &Stats::of(xs));
