@@ -5,6 +5,7 @@ pub mod flow_lm;
 pub mod layer_scale;
 pub mod mimi;
 pub mod mlp;
+pub mod preprocess;
 pub mod resample;
 pub mod rope;
 pub mod seanet;

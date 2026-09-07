@@ -70,6 +70,11 @@ struct Args {
     /// Print a line per iteration as well as the summary.
     #[arg(long, default_value_t = false)]
     per_iter: bool,
+
+    /// Normalize the input for this language before tokenizing: `en`, `fr`, `de`, `es` or `pt`.
+    /// Off by default so measurements stay comparable with runs that predate the flag.
+    #[arg(long)]
+    lang: Option<String>,
 }
 
 struct StdRng {
@@ -198,6 +203,8 @@ fn row(label: &str, unit: &str, prec: usize, st: &Stats) {
 struct Bench<'a>(&'a Args);
 
 impl xn::WithQ for Bench<'_> {
+    type Output = ();
+
     fn run<Q: BackendQ>(self, dev: Q::B) -> xn::Result<()> {
         self.bench::<Q>(dev).map_err(|e| xn::Error::msg(format!("{e:?}")))
     }
@@ -226,9 +233,17 @@ impl Bench<'_> {
 
         // Tokenize up front: the loop needs the tokens anyway, and the KV cache is sized from
         // them. Long inputs are split into sentences, as `pocket_tts` does.
+        let input = match args.lang.as_deref() {
+            None => std::borrow::Cow::Borrowed(args.input.as_str()),
+            Some(lang) => {
+                use std::str::FromStr;
+                let lang = ptts::preprocess::Lang::from_str(lang)?;
+                std::borrow::Cow::Owned(ptts::preprocess::normalize_text(&args.input, lang))
+            }
+        };
         let chunks = ptts::tts_model::split_into_best_sentences(
             model.flow_lm.conditioner.tokenizer.as_deref().context("no tokenizer")?,
-            &args.input,
+            &input,
             None,
         )?;
         let chunks = chunks
@@ -284,7 +299,7 @@ impl Bench<'_> {
             "model {}  threads {}  input {} chars  audio {:.0}ms  frames/iter {}",
             args.model.display(),
             xn::get_num_threads(),
-            args.input.len(),
+            input.len(),
             audio_ms(first),
             first.frames.len(),
         );

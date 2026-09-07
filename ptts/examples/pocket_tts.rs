@@ -61,6 +61,12 @@ struct Args {
 
     #[arg(long)]
     pad_to: Option<usize>,
+
+    /// Normalize the text for this language before tokenizing: `en`, `fr`, `de`, `es` or `pt`.
+    /// Drops characters the model never saw and spells out `@`, `+` and `=`. Omitted, the text
+    /// is tokenized exactly as given.
+    #[arg(long)]
+    lang: Option<String>,
 }
 
 const VOICES: &[&str] =
@@ -328,7 +334,16 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
     };
 
     let tokenizer = SpTokenizer::open(&tokenizer_path)?;
-    let chunks = split_into_best_sentences(&tokenizer, &args.text, None)?;
+    let text = match args.lang.as_deref() {
+        None => std::borrow::Cow::Borrowed(args.text.as_str()),
+        Some(lang) => {
+            let lang = ptts::preprocess::Lang::from_str(lang)?;
+            let normalized = ptts::preprocess::normalize_text(&args.text, lang);
+            tracing::info!(?normalized, "normalized input text");
+            std::borrow::Cow::Owned(normalized)
+        }
+    };
+    let chunks = split_into_best_sentences(&tokenizer, &text, None)?;
 
     let mut rng = match args.rng_values {
         Some(path) => Rng::from_file(&path)?,
