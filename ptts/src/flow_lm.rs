@@ -58,9 +58,6 @@ pub struct FlowLM<Q: BackendQ> {
     pub transformer: StreamingTransformer<Q>,
     pub emb_std: Tensor<Q::T, Q::B>,
     pub emb_mean: Tensor<Q::T, Q::B>,
-    /// Host copy of `bos_emb`. `replace_nan_with_bos` runs on the host and needs
-    /// it every step; the tensor itself is never used on-device, and reading it
-    /// back each step costs a full device round trip on a gpu backend.
     bos_emb: Vec<Q::T>,
     pub input_linear: Linear<Q::T, Q::B>,
     out_norm_weight: Tensor<Q::T, Q::B>,

@@ -120,10 +120,7 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
         let (k, v) = state.complete_kv(&k, &v)?;
 
         let inv_sqrt_d = 1.0 / (d as f32).sqrt();
-        // Single-query decode is the steady-state case; composing it costs a batch of `h` tiny
-        // matmuls per projection plus a separate softmax pass. The fused kernel wants exactly
-        // the [b, t, h, d] layout we already have, and falls back internally if the operand
-        // layout is not one it handles.
+
         let x = if t == 1 {
             q.sdpa_decode(&k, &v, mask, inv_sqrt_d)?
         } else {
@@ -132,6 +129,7 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
             let k = k.transpose(1, 2)?;
             let v = v.transpose(1, 2)?;
 
+            // Scaled dot-product attention
             let scale = Q::T::from_f32(inv_sqrt_d);
             let attn = q.matmul_t(&k)?.scale(scale)?;
             let attn = match mask {
