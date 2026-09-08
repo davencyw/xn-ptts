@@ -59,6 +59,14 @@ struct Args {
     #[arg(long)]
     wait_to_decode: bool,
 
+    /// Decode every queued frame in one call instead of one frame per call.
+    #[arg(long, default_value_t = false)]
+    decode_batching: bool,
+
+    /// Number of CPU threads for tensor ops.
+    #[arg(long)]
+    threads: Option<usize>,
+
     #[arg(long)]
     pad_to: Option<usize>,
 
@@ -182,6 +190,10 @@ fn run_cpu(args: Args) -> Result<()> {
 }
 fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(threads) = args.threads {
+        // Must happen before the first tensor op, since it sets the size of rayon's global pool.
+        xn::set_num_threads(threads);
+    }
     let _guard = init_tracing(args.chrome_tracing);
 
     #[cfg(feature = "cuda")]
@@ -494,6 +506,7 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
         let is_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let jh = spawn({
             let wait_to_decode = args.wait_to_decode;
+            let decode_batching = args.decode_batching;
             let model = model.clone();
             let is_done = is_done.clone();
             move || {
@@ -505,9 +518,19 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
                     }
                 }
                 while let Ok(next_latent) = latent_rx.recv() {
-                    // Decode latent to audio
-                    let next_latent = next_latent.to()?;
-                    let audio_chunk = model.decode_latent(&next_latent, &mut mimi_state)?;
+                    // Decode every latent the generator has queued in one streaming call: the
+                    // decoder is exact for any number of frames and one call over several frames
+                    // is much cheaper than one call per frame. Only what is already queued is
+                    // taken, so the first frame never waits.
+                    let mut latents = vec![next_latent];
+                    if decode_batching {
+                        while let Ok(more) = latent_rx.try_recv() {
+                            latents.push(more);
+                        }
+                    }
+                    let refs: Vec<&Tensor<Q::T, _>> = latents.iter().collect();
+                    let batch = Tensor::cat(&refs, 1)?.to()?;
+                    let audio_chunk = model.decode_latent(&batch, &mut mimi_state)?;
                     audio_chunks.push(audio_chunk);
                 }
                 // Concatenate audio
