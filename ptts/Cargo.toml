@@ -38,6 +38,9 @@ vulkan = ["xn/vulkan"]
 metal = ["xn/metal"]
 webgpu = ["xn/webgpu"]
 accelerate = ["xn/accelerate"]
+# Route f32 matmul through XNNPACK's pre-packed fully-connected operator.
+# Needs XNNPACK_DIR; see xn's src/xnnpack.rs.
+xnnpack = ["xn/xnnpack"]
 sp = ["dep:sentencepiece"]
 
 [[example]]

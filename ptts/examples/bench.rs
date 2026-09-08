@@ -2,7 +2,22 @@
 //!
 //! Loads a local model once, then generates the same utterance `--iters` times and reports
 //! time-to-first-audio, per-frame time, total generate time and RTF. Model load and voice
-//! conditioning are timed separately and excluded from the per-iteration statistics.
+//! conditioning are timed separately and excluded from the per-iteration statistics, since a
+//! server pays them once and then serves many requests.
+//!
+//! ```bash
+//! cargo run --release --features sp,accelerate --example bench -- \
+//!   --model model/model.q8.gguf --config model/config.json --quant q8 \
+//!   --voice voices/freya.safetensors --threads 8 --iters 20
+//! ```
+//!
+//! Unlike `pocket_tts` this never downloads anything and only accepts precomputed voice
+//! embeddings: it measures one specific model. Mimi decoding runs on the generating thread
+//! rather than overlapped, so a frame's time is its sampling plus its decoding; `pocket_tts`
+//! overlaps the two and will report a better RTF for the same weights.
+//!
+//! `--mimi-batch` decodes several frames of latent per Mimi call, which is where most of the
+//! headroom on a small CPU is: see its own documentation below.
 
 #[path = "model_helpers.rs"]
 mod model_helpers;
@@ -71,6 +86,32 @@ struct Args {
     #[arg(long, default_value_t = false)]
     per_iter: bool,
 
+    /// Decode this many frames of latent per Mimi call instead of one.
+    ///
+    /// Mimi turns each latent into 16 transformer/seanet timesteps, so decoding one frame at
+    /// a time hands every gemm in the decoder m=16 -- a single microkernel row panel, with
+    /// almost no reuse of the packed weight. Batching raises m proportionally and is exact:
+    /// the decoder transformer is causal and the seanet convolutions are streaming, so N
+    /// latents in one call produce the same samples as N calls. It costs latency, since the
+    /// first chunk of audio waits for N frames to be sampled.
+    #[arg(long, default_value_t = 1)]
+    mimi_batch: usize,
+
+    /// With `--pipeline`, threads for the flow LM stage and for the Mimi stage respectively,
+    /// given as `SAMPLE:DECODE`.
+    ///
+    /// Each stage gets its own xn pool rather than sharing the process-wide one. Sharing is
+    /// what makes `--pipeline` nearly free of benefit: xn's pool has a single job slot, so
+    /// whichever stage publishes first fans out and the other silently runs serially on its
+    /// own thread, alternating frame by frame. Sized pools let both fan out at once.
+    ///
+    /// The two numbers should add up to about the core count. The flow LM barely scales past
+    /// one core -- it is a batch-1 autoregressive stream of small matmuls -- while the Mimi
+    /// decoder scales well, so the interesting splits give Mimi most of the machine. Unset
+    /// leaves both stages on the process-wide pool, i.e. the old contending behaviour.
+    #[arg(long, value_name = "SAMPLE:DECODE")]
+    split: Option<String>,
+
     /// Overlap Mimi decoding with the next frame's sampling on a second thread, as
     /// `pocket_tts` does. Frame N+1 needs only frame N's latent, never its PCM, so the decode
     /// is off the critical path. `per-frame` then reports the interval between PCM chunks --
@@ -102,6 +143,20 @@ impl ptts::flow_lm::Rng for StdRng {
         use rand::Rng;
         self.inner.sample(self.distr)
     }
+}
+
+/// `SAMPLE:DECODE` from `--split`.
+fn parse_split(s: &str) -> Result<(usize, usize)> {
+    let (sample, decode) = s.split_once(':').context("--split wants SAMPLE:DECODE, e.g. 1:3")?;
+    let parse = |v: &str, what: &str| -> Result<usize> {
+        let n: usize =
+            v.trim().parse().with_context(|| format!("--split {what} is not a number"))?;
+        if n == 0 {
+            anyhow::bail!("--split {what} must be at least 1")
+        }
+        Ok(n)
+    };
+    Ok((parse(sample, "sample")?, parse(decode, "decode")?))
 }
 
 /// One iteration's timings.
@@ -145,33 +200,54 @@ fn one<Q: BackendQ>(
         let nan: Tensor<f32, Q::B> = Tensor::from_vec(vec![f32::NAN; ldim], (1, 1, ldim), dev)?;
         let mut prev_latent = nan.to::<Q::T>()?;
         let mut eos_countdown: Option<usize> = None;
+        // Latents sampled but not yet handed to Mimi, with the sampling time of each.
+        let mut pending: Vec<Tensor<Q::T, Q::B>> = Vec::with_capacity(args.mimi_batch);
+        let mut pending_sample: Vec<Duration> = Vec::with_capacity(args.mimi_batch);
 
-        for _ in 0..max_frames_for(tokens.len()) {
+        for i in 0..max_frames_for(tokens.len()) {
             let frame_start = Instant::now();
             let (next_latent, is_eos) = model.generate_step(&mut state, &prev_latent, &mut rng)?;
-            let sampled = frame_start.elapsed();
-            // Decoding on this thread rather than overlapped, so the measurement attributes
-            // sampling and decoding to the frame that caused them.
-            let pcm = model.decode_latent(&next_latent, &mut mimi_state)?.to_vec()?;
-            let frame = frame_start.elapsed();
-            frames.push(frame);
-            sample_t.push(sampled);
-            decode_t.push(frame - sampled);
-            if !pcm.is_empty() {
-                ttfa.get_or_insert_with(|| start.elapsed());
-                samples += pcm.len();
-            }
+            pending_sample.push(frame_start.elapsed());
+            pending.push(next_latent.clone());
+            prev_latent = next_latent;
 
             if is_eos && eos_countdown.is_none() {
                 eos_countdown = Some(*frames_after_eos);
             }
-            if let Some(countdown) = eos_countdown.as_mut() {
-                if *countdown == 0 {
-                    break;
+            let last = match eos_countdown.as_mut() {
+                Some(0) => true,
+                Some(countdown) => {
+                    *countdown -= 1;
+                    false
                 }
-                *countdown -= 1;
+                None => i + 1 == max_frames_for(tokens.len()),
+            };
+
+            // Decoding on this thread rather than overlapped, so the measurement attributes
+            // sampling and decoding to the frames that caused them.
+            if pending.len() == args.mimi_batch || last {
+                let batch = pending.len();
+                let refs: Vec<&Tensor<Q::T, Q::B>> = pending.iter().collect();
+                let latents = if batch == 1 { pending[0].clone() } else { Tensor::cat(&refs, 1)? };
+                let t = Instant::now();
+                let pcm = model.decode_latent(&latents, &mut mimi_state)?.to_vec()?;
+                // Charged evenly to the frames in the batch, so the per-frame series stays
+                // comparable across `--mimi-batch` settings.
+                let each = t.elapsed() / batch as u32;
+                for s in pending_sample.drain(..) {
+                    frames.push(s + each);
+                    sample_t.push(s);
+                    decode_t.push(each);
+                }
+                pending.clear();
+                if !pcm.is_empty() {
+                    ttfa.get_or_insert_with(|| start.elapsed());
+                    samples += pcm.len();
+                }
             }
-            prev_latent = next_latent;
+            if last {
+                break;
+            }
         }
     }
 
@@ -184,8 +260,9 @@ fn one<Q: BackendQ>(
 struct Decoded {
     /// Per frame, the `decode_latent` call itself.
     decode_t: Vec<Duration>,
-    /// When each non-empty PCM chunk became available.
-    arrivals: Vec<Instant>,
+    /// When each non-empty PCM chunk became available, and how many frames it covered, so a
+    /// `--mimi-batch` chunk can be charged to its frames rather than counted once.
+    arrivals: Vec<(Instant, usize)>,
     samples: usize,
 }
 
@@ -200,6 +277,7 @@ fn one_pipelined<Q: BackendQ>(
     base_state: &TTSState<Q>,
     chunks: &[(Vec<u32>, usize)],
     args: &Args,
+    split: Option<(usize, usize)>,
 ) -> Result<Run> {
     let dev = model.device();
     let ldim = model.flow_lm.ldim;
@@ -209,6 +287,11 @@ fn one_pipelined<Q: BackendQ>(
     let mut decode_t = Vec::new();
     let mut ttfa = None;
     let mut samples = 0usize;
+    // Sampling runs on this thread. Left bound afterwards: the same thread samples every
+    // iteration, and `bind` is idempotent for a given name.
+    if let Some((sample, _)) = split {
+        xn::threadpool::bind("flow-lm", sample);
+    }
     let start = Instant::now();
 
     for (tokens, frames_after_eos) in chunks.iter() {
@@ -218,14 +301,25 @@ fn one_pipelined<Q: BackendQ>(
         let (tx, rx) = std::sync::mpsc::channel::<Tensor<Q::T, Q::B>>();
         let decoded = std::thread::scope(|scope| -> Result<Decoded> {
             let decoder = scope.spawn(move || -> Result<Decoded> {
+                // Named, so the pool is built once and reused: this thread is recreated per
+                // chunk per iteration, and a fresh pool each time would leak its workers.
+                if let Some((_, decode)) = split {
+                    xn::threadpool::bind("mimi-decode", decode);
+                }
                 let mut mimi_state = model.init_mimi_state(1, MIMI_CONTEXT_SIZE)?;
                 let mut out = Decoded { decode_t: Vec::new(), arrivals: Vec::new(), samples: 0 };
                 while let Ok(latent) = rx.recv() {
+                    let batch = latent.dim(1usize)?;
                     let t = Instant::now();
                     let pcm = model.decode_latent(&latent, &mut mimi_state)?.to_vec()?;
-                    out.decode_t.push(t.elapsed());
+                    // Charged evenly to the frames in the batch, so the series stays
+                    // per-frame and comparable across `--mimi-batch` settings.
+                    let each = t.elapsed() / batch as u32;
+                    for _ in 0..batch {
+                        out.decode_t.push(each);
+                    }
                     if !pcm.is_empty() {
-                        out.arrivals.push(Instant::now());
+                        out.arrivals.push((Instant::now(), batch));
                         out.samples += pcm.len();
                     }
                 }
@@ -236,27 +330,44 @@ fn one_pipelined<Q: BackendQ>(
             let nan: Tensor<f32, Q::B> = Tensor::from_vec(vec![f32::NAN; ldim], (1, 1, ldim), dev)?;
             let mut prev_latent = nan.to::<Q::T>()?;
             let mut eos_countdown: Option<usize> = None;
+            let mut pending: Vec<Tensor<Q::T, Q::B>> = Vec::with_capacity(args.mimi_batch);
 
-            for _ in 0..max_frames_for(tokens.len()) {
+            for i in 0..max_frames_for(tokens.len()) {
                 let frame_start = Instant::now();
                 let (next_latent, is_eos) =
                     model.generate_step(&mut state, &prev_latent, &mut rng)?;
                 sample_t.push(frame_start.elapsed());
-                // A send failure means the decoder died; its error surfaces on join.
-                if tx.send(next_latent.clone()).is_err() {
-                    break;
-                }
+                pending.push(next_latent.clone());
+                prev_latent = next_latent;
 
                 if is_eos && eos_countdown.is_none() {
                     eos_countdown = Some(*frames_after_eos);
                 }
-                if let Some(countdown) = eos_countdown.as_mut() {
-                    if *countdown == 0 {
+                let last = match eos_countdown.as_mut() {
+                    Some(0) => true,
+                    Some(countdown) => {
+                        *countdown -= 1;
+                        false
+                    }
+                    None => i + 1 == max_frames_for(tokens.len()),
+                };
+
+                if pending.len() == args.mimi_batch || last {
+                    let refs: Vec<&Tensor<Q::T, Q::B>> = pending.iter().collect();
+                    let latents = if pending.len() == 1 {
+                        pending[0].clone()
+                    } else {
+                        Tensor::cat(&refs, 1)?
+                    };
+                    pending.clear();
+                    // A send failure means the decoder died; its error surfaces on join.
+                    if tx.send(latents).is_err() {
                         break;
                     }
-                    *countdown -= 1;
                 }
-                prev_latent = next_latent;
+                if last {
+                    break;
+                }
             }
             // Close the channel so the decoder finishes, then wait for the tail of the audio.
             drop(tx);
@@ -266,11 +377,14 @@ fn one_pipelined<Q: BackendQ>(
         // Intervals between PCM chunks, with the first measured from the start of the
         // iteration, so the series sums to the streaming wall time.
         let mut prev = start;
-        for a in decoded.arrivals.iter() {
-            frames.push(a.duration_since(prev));
+        for (a, batch) in decoded.arrivals.iter() {
+            let each = a.duration_since(prev) / *batch as u32;
+            for _ in 0..*batch {
+                frames.push(each);
+            }
             prev = *a;
         }
-        if let Some(first) = decoded.arrivals.first() {
+        if let Some((first, _)) = decoded.arrivals.first() {
             ttfa.get_or_insert_with(|| first.duration_since(start));
         }
         decode_t.extend(decoded.decode_t);
@@ -387,9 +501,13 @@ impl Bench<'_> {
         model.prompt_audio(&mut base_state, &voice_emb)?;
         let voice_ms = ms(t_voice.elapsed());
 
+        let split = match args.split.as_deref() {
+            Some(spec) => Some(parse_split(spec)?),
+            None => None,
+        };
         let generate = |m: &TTSModel<Q>, st: &TTSState<Q>| {
             if args.pipeline {
-                one_pipelined(m, st, &chunks, args)
+                one_pipelined(m, st, &chunks, args, split)
             } else {
                 one(m, st, &chunks, args)
             }
@@ -428,7 +546,19 @@ impl Bench<'_> {
             input.len(),
             audio_ms(first),
             first.frames.len(),
-            if args.pipeline { "  [pipelined]" } else { "" },
+            {
+                let mut tags = Vec::new();
+                if args.pipeline {
+                    tags.push("pipelined".to_string());
+                }
+                if let Some((sample, decode)) = split {
+                    tags.push(format!("split {sample}:{decode}"));
+                }
+                if args.mimi_batch != 1 {
+                    tags.push(format!("mimi-batch {}", args.mimi_batch));
+                }
+                if tags.is_empty() { String::new() } else { format!("  [{}]", tags.join(", ")) }
+            },
         );
         println!("load {load_ms:.1}ms, voice conditioning {voice_ms:.1}ms (both excluded below)");
         println!();

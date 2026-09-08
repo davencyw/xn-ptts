@@ -27,7 +27,7 @@ CI deletes `.cargo/config.toml` before building because it pins `target-cpu=nati
 
 Cargo features that gate optional functionality:
 
-- `ptts`: `sp` (SentencePiece tokenizer, required by the `pocket_tts` and `bench` examples), `cuda`, `accelerate`.
+- `ptts`: `sp` (SentencePiece tokenizer, required by the `pocket_tts` and `bench` examples), `cuda`, `accelerate`, `xnnpack`.
 - `ptts-pyo3`: `cuda`, `accelerate` (each forwards to both `xn/*` and `ptts/*`).
 
 Run the CLI example:
@@ -47,6 +47,34 @@ cargo run --release --features sp,accelerate --example bench -- \
 ```
 
 `bench` takes explicit paths and a precomputed voice embedding, never downloads, and reports time-to-first-audio, per-frame time, total generate time and RTF over `--iters` runs, excluding the one-off model load and voice conditioning. It decodes each frame on the generating thread rather than overlapping Mimi with the next frame's sampling as `pocket_tts` does, so its RTF reads lower than `pocket_tts` for the same weights — don't compare the two directly. `--threads` defaults to xn's one-per-logical-core, usually too many for a single autoregressive stream. For profiling rather than measuring, `pocket_tts --chrome-tracing` writes a Chrome trace for https://ui.perfetto.dev.
+
+`--mimi-batch N` decodes N frames of latent per Mimi call instead of one, trading time-to-first-audio for throughput. Mimi expands each latent into 16 timesteps, so decoding one frame at a time hands every gemm in the decoder `m=16` — a single microkernel row panel, with almost no reuse of the packed weight — and the decoder is where most of the per-frame time goes on a small CPU. Batching is exact rather than an approximation: the decoder transformer is causal and the seanet convolutions are streaming, so N latents in one call produce the same samples as N successive calls (verified bit-comparable up to f32 summation order, including across the 250-frame context trim). Always report the `--mimi-batch 1` number alongside any batched one, since the two are different latency/throughput operating points rather than a before and after.
+
+### XNNPACK f32 matmul
+
+`--features xnnpack` routes f32 matmul through XNNPACK's `fully_connected` operator instead of the `gemm` crate. It matters here because `gemm` re-packs the weight panel on every call, and batch-1 decode gives it only 16 rows of output to amortise that over (Mimi expands one latent into 16 timesteps). XNNPACK packs the weights once inside `xnn_create_*` and caches the operator, so it reaches at `m = 16` the throughput `gemm` needs `m = 128` for. Measured on a Pi 5, Mimi decode drops from 30.5 to 13.8 ms per frame and RTF goes 1.65 -> 2.57 at `--threads 4`.
+
+It needs a prebuilt XNNPACK, located from `XNNPACK_DIR` or from an `XNNPACK` directory sitting next to this workspace:
+
+```
+git clone --depth 1 https://github.com/google/XNNPACK.git
+cd XNNPACK
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DXNNPACK_LIBRARY_TYPE=static \
+  -DXNNPACK_BUILD_TESTS=OFF -DXNNPACK_BUILD_BENCHMARKS=OFF \
+  -DXNNPACK_BUILD_ALL_MICROKERNELS=OFF -DXNNPACK_ENABLE_KLEIDIAI=OFF
+ninja -C build XNNPACK
+```
+
+`XN_XNNPACK=0` disables the path at runtime, so one binary serves both sides of an A/B. `XN_XNNPACK_STATS=1` prints each distinct gemm shape the first time it is taken or declined, which is how to check the path is carrying the traffic rather than quietly declining it.
+
+Two caveats. XNNPACK changes the generated audio: the gemm is correct to under 1e-5 relative against an f64 reference on every shape the model issues, but a last-bit difference in a sampled latent feeds back through the autoregressive loop, so the output is a different (equally valid) sample rather than a bit-identical one. And enabling it makes `--mimi-batch` mostly redundant, since batching existed to work around the same small-`m` problem.
+
+## Threads
+
+`--threads` sizes xn's *intra-operator* pool; it does not cap how many cores the process uses. `--pipeline` adds a decode thread outside that pool, so `--threads 1 --pipeline` runs on about 1.3 cores, not 1. For a genuine single-core number, pin with `taskset -c 0`.
+
+`--split SAMPLE:DECODE` gives each pipeline stage its own xn pool instead of sharing the process-wide one. Sharing is why `--pipeline` alone buys little: the pool has a single job slot, so whichever stage publishes first fans out and the other silently runs serially. The stages scale very differently -- the flow LM is memory-bound (about 125 MB of weights per frame against a ~14 GB/s ceiling that does not scale with cores) and barely improves past one core, while the Mimi decoder scales well -- so the useful splits give Mimi most of the machine, e.g. `--split 1:2` on four cores.
 
 ## WASM build
 

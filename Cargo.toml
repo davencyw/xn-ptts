@@ -56,3 +56,6 @@ debug = true
 [profile.release-no-debug]
 inherits = "release"
 debug = false
+
+[patch.crates-io]
+xn = { path = "../xn-bench/xn-core" }

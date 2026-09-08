@@ -929,9 +929,8 @@ dependencies = [
 
 [[package]]
 name = "gemm"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa0673db364b12263d103b68337a68fbecc541d6f6b61ba72fe438654709eacb"
+version = "0.20.0"
+source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
 dependencies = [
  "dyn-stack",
  "gemm-c32",
@@ -949,9 +948,8 @@ dependencies = [
 
 [[package]]
 name = "gemm-c32"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "086936dbdcb99e37aad81d320f98f670e53c1e55a98bee70573e83f95beb128c"
+version = "0.20.0"
+source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
 dependencies = [
  "dyn-stack",
  "gemm-common",
@@ -964,9 +962,8 @@ dependencies = [
 
 [[package]]
 name = "gemm-c64"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20c8aeeeec425959bda4d9827664029ba1501a90a0d1e6228e48bef741db3a3f"
+version = "0.20.0"
+source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
 dependencies = [
  "dyn-stack",
  "gemm-common",
@@ -979,9 +976,8 @@ dependencies = [
 
 [[package]]
 name = "gemm-common"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88027625910cc9b1085aaaa1c4bc46bb3a36aad323452b33c25b5e4e7c8e2a3e"
+version = "0.20.0"
+source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
 dependencies = [
  "bytemuck",
  "dyn-stack",
@@ -1000,9 +996,8 @@ dependencies = [
 
 [[package]]
 name = "gemm-f16"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3df7a55202e6cd6739d82ae3399c8e0c7e1402859b30e4cb780e61525d9486e"
+version = "0.20.0"
+source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
 dependencies = [
  "dyn-stack",
  "gemm-common",
@@ -1018,9 +1013,8 @@ dependencies = [
 
 [[package]]
 name = "gemm-f32"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02e0b8c9da1fbec6e3e3ab2ce6bc259ef18eb5f6f0d3e4edf54b75f9fd41a81c"
+version = "0.20.0"
+source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
 dependencies = [
  "dyn-stack",
  "gemm-common",
@@ -1033,9 +1027,8 @@ dependencies = [
 
 [[package]]
 name = "gemm-f64"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "056131e8f2a521bfab322f804ccd652520c79700d81209e9d9275bbdecaadc6a"
+version = "0.20.0"
+source = "git+https://github.com/gradium-ai/gemm?tag=v0.20.0#b09c3d2d6fbf317ae6a8a1e4156aa6f5cee08138"
 dependencies = [
  "dyn-stack",
  "gemm-common",
@@ -4220,8 +4213,6 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 [[package]]
 name = "xn"
 version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71380fcb8e33af18a63293b44e86590bca6c3785f66bf80fe73737a11760203b"
 dependencies = [
  "ash",
  "bindgen_cuda",
