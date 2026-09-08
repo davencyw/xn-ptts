@@ -3,69 +3,226 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pocket TTS - WebAssembly Demo</title>
+<title>Phonon</title>
 <style>
+  /* Tokens on bare :root are the light palette; the dark block below only
+     redefines them, so every colour has a definition in both themes. */
+  :root {
+    --bg: #fcfcfd;
+    --surface: #f3f4f6;
+    --text: #16181d;
+    --muted: #6b7280;
+    --faint: #d3d6dc;
+    --accent: #3b5bdb;
+    --accent-text: #ffffff;
+    --meter: #3b5bdb;
+    --meter-off: #e6e8ec;
+    --radius: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0c0d10;
+      --surface: #16181d;
+      --text: #e8eaed;
+      --muted: #8b929e;
+      --faint: #2a2d35;
+      --accent: #7c93f5;
+      --accent-text: #0c0d10;
+      --meter: #7c93f5;
+      --meter-off: #1c1f26;
+    }
+  }
+
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; background: #111; color: #ddd; }
-  h1 { margin-bottom: 8px; color: #eee; }
-  .subtitle { color: #888; margin-bottom: 24px; }
-  .subtitle a { color: #60a5fa; }
-  .section { margin-bottom: 20px; }
-  label { display: block; font-weight: 600; margin-bottom: 6px; color: #ccc; }
-  select, textarea, button { font-family: inherit; font-size: 14px; }
-  select { padding: 6px 10px; border: 1px solid #444; border-radius: 4px; background: #222; color: #ddd; }
-  textarea { width: 100%; padding: 10px; border: 1px solid #444; border-radius: 4px; resize: vertical; background: #1a1a1a; color: #ddd; }
-  button { padding: 10px 24px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
-  button:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
-  button:hover:not(:disabled) { background: #1d4ed8; }
-  #status { margin-top: 12px; padding: 10px; background: #1a1a2e; border: 1px solid #333; border-radius: 4px; font-size: 13px; white-space: pre-wrap; color: #aaa; }
-  .progress-bar { width: 100%; height: 6px; background: #333; border-radius: 3px; margin-top: 6px; overflow: hidden; }
-  .progress-bar .fill { height: 100%; background: #2563eb; transition: width 0.2s; }
-  audio { width: 100%; margin-top: 12px; }
-  .controls { display: flex; gap: 10px; align-items: end; }
-  .controls .section { margin-bottom: 0; }
-  #visualizer { width: 100%; height: 140px; margin-top: 16px; display: block; }
-  .slider-section { margin-bottom: 0; margin-left: auto; }
-  .slider-section label { display: block; font-weight: 600; margin-bottom: 6px; color: #ccc; }
-  .slider-section input[type="range"] { width: 120px; vertical-align: middle; }
-  .slider-section .slider-value { color: #aaa; font-size: 14px; margin-left: 4px; }
+
+  /* The page is a single screen: nothing here should ever need scrolling, so
+     the shell is exactly the viewport tall and the meter takes whatever space
+     the controls leave. `dvh` rather than `vh` so mobile browser chrome
+     collapsing does not cut the bottom off. */
+  html, body { height: 100%; }
+  body {
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    max-width: 42rem;
+    margin: 0 auto;
+    min-height: 100dvh;
+    max-height: 100dvh;
+    padding: clamp(1.25rem, 4vh, 2.5rem) 1.25rem clamp(1rem, 3vh, 1.75rem);
+    display: flex;
+    flex-direction: column;
+    gap: clamp(0.75rem, 2vh, 1.25rem);
+    overflow: hidden;
+  }
+
+  /* ---- masthead ---- */
+  header {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    flex: none;
+  }
+  /* The mark is a solid black tile with no alpha, so it would sink into the
+     dark background unaided: the hairline ring keeps its edge legible in both
+     themes and reads as an icon rather than a stray square. */
+  #logo {
+    width: 1.75rem;
+    height: 1.75rem;
+    border-radius: 6px;
+    border: 1px solid var(--faint);
+    flex: none;
+  }
+  .wordmark {
+    font-size: 1.75rem;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+  }
+  .tagline { color: var(--muted); font-size: 0.9375rem; }
+  .tagline a { color: inherit; text-decoration: underline; text-decoration-color: var(--faint); text-underline-offset: 2px; }
+  .tagline a:hover { text-decoration-color: var(--accent); }
+
+  /* ---- form ---- */
+  #controls {
+    display: flex;
+    flex-direction: column;
+    gap: clamp(0.625rem, 1.8vh, 1rem);
+    flex: none;
+  }
+  /* Needed, and not redundant: the `hidden` attribute works through the UA
+     stylesheet's `display: none`, which an author-level `display: flex` above
+     outranks. Without this the controls stay visible and clickable before the
+     model is loaded. */
+  #controls[hidden] { display: none; }
+  .field { min-width: 0; }
+  label {
+    display: block;
+    font-size: 0.8125rem;
+    font-weight: 500;
+    color: var(--muted);
+    margin-bottom: 0.375rem;
+  }
+  textarea, select, button, input { font: inherit; }
+  textarea {
+    width: 100%;
+    padding: 0.75rem 0.875rem;
+    border: 1px solid var(--faint);
+    border-radius: var(--radius);
+    background: var(--bg);
+    color: var(--text);
+    resize: vertical;
+    font-size: 1rem;
+  }
+  select {
+    width: 100%;
+    padding: 0.625rem 0.875rem;
+    border: 1px solid var(--faint);
+    border-radius: var(--radius);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.9375rem;
+  }
+  textarea:focus-visible, select:focus-visible, button:focus-visible, input:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .row { display: grid; gap: 0.75rem; grid-template-columns: 1fr 1fr; align-items: end; }
+
+  .temp-row { display: flex; align-items: center; gap: 0.75rem; }
+  input[type="range"] {
+    flex: 1;
+    accent-color: var(--accent);
+    background: transparent;
+  }
+  .slider-value {
+    color: var(--text);
+    font-size: 0.875rem;
+    font-variant-numeric: tabular-nums;
+    min-width: 2ch;
+  }
+
+  button {
+    width: 100%;
+    padding: 0.8125rem 1.25rem;
+    background: var(--accent);
+    color: var(--accent-text);
+    border: none;
+    border-radius: var(--radius);
+    font-size: 0.9375rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+  button:hover:not(:disabled) { opacity: 0.88; }
+  button:disabled { background: var(--surface); color: var(--muted); cursor: not-allowed; }
+
+  /* ---- output ---- */
+  .progress-bar {
+    width: 100%;
+    height: 2px;
+    background: var(--faint);
+    border-radius: 1px;
+    overflow: hidden;
+    flex: none;
+  }
+  .progress-bar .fill { height: 100%; background: var(--accent); transition: width 0.2s; }
+
+  #status {
+    flex: none;
+    font-size: 0.8125rem;
+    line-height: 1.6;
+    color: var(--muted);
+    white-space: pre-wrap;
+    font-variant-numeric: tabular-nums;
+  }
+  #status:empty { display: none; }
+
+  #visualizer {
+    width: 100%;
+    display: block;
+    flex: 1 1 auto;
+    min-height: 3rem;
+  }
+
+  #audio-container { flex: none; }
+  #audio-container:empty { display: none; }
+  audio { width: 100%; display: block; }
 </style>
 </head>
 <body>
 
-<p class="subtitle"><a href="https://github.com/kyutai-labs/pocket-tts" target="_blank"> Pocket TTS</a> running in the browser via WebAssembly using <a href="https://github.com/LaurentMazare/xn/tree/main/wasm-pocket-tts#wasm-pocket-tts" target="_blank">xn</a> </p>
+<header>
+  <img id="logo" src="logo.png" alt="Gradium" width="28" height="28">
+  <div class="wordmark">Phonon</div>
+</header>
 
-<div class="section">
-  <label for="text">Text to speak</label>
-  <textarea id="text" rows="3">This is a test for the pocket text to speech system, showing great audio with only 100 million parameters.</textarea>
-</div>
+<button id="load-btn">Load model (136 MB)</button>
 
-<div class="controls">
-  <div class="section">
-    <label for="voice">Voice</label>
-    <select id="voice">
-      <option value="alba" selected>Alba</option>
-      <option value="marius">Marius</option>
-      <option value="javert">Javert</option>
-      <option value="fantine">Fantine</option>
-      <option value="cosette">Cosette</option>
-      <option value="eponine">Eponine</option>
-      <option value="azelma">Azelma</option>
-    </select>
+<!-- Everything here needs the model, so it stays hidden until the model is in.
+     The voice list is filled in from the loaded checkpoint. -->
+<div id="controls" hidden>
+  <div class="field">
+    <label for="text">Text</label>
+    <textarea id="text" rows="2">Phonon runs entirely on your device. No server, no account, no waiting.</textarea>
   </div>
-  <div class="section">
-    <label for="quant">Quantization</label>
-    <select id="quant">
-      <option value="f32">f32</option>
-      <option value="q8" selected>q8</option>
-    </select>
+
+  <div class="row">
+    <div class="field">
+      <label for="voice">Voice</label>
+      <select id="voice"></select>
+    </div>
+    <div class="field">
+      <label for="temperature">Expressiveness</label>
+      <div class="temp-row">
+        <input type="range" id="temperature" min="0.1" max="1.0" step="0.1" value="0.7">
+        <span id="temp-value" class="slider-value">0.7</span>
+      </div>
+    </div>
   </div>
-  <button id="load-btn">Load Weights (146MB)</button>
-  <button id="generate-btn" style="display:none">Generate</button>
-  <div class="slider-section">
-    <label for="temperature">Temperature <span id="temp-value" class="slider-value">0.7</span></label>
-    <input type="range" id="temperature" min="0.1" max="1.0" step="0.1" value="0.7">
-  </div>
+
+  <button id="generate-btn">Generate</button>
 </div>
 
 <div class="progress-bar" id="progress-bar" style="display:none"><div class="fill" id="progress-fill"></div></div>
@@ -75,10 +232,10 @@
 
 <script type="module">
 const statusEl = document.getElementById('status');
+const controls = document.getElementById('controls');
 const loadBtn = document.getElementById('load-btn');
 const btn = document.getElementById('generate-btn');
 const voiceSelect = document.getElementById('voice');
-const quantSelect = document.getElementById('quant');
 const progressBar = document.getElementById('progress-bar');
 const progressFill = document.getElementById('progress-fill');
 const canvas = document.getElementById('visualizer');
@@ -90,13 +247,6 @@ tempSlider.addEventListener('input', () => {
   tempValue.textContent = tempSlider.value;
 });
 
-const QUANT_SIZE_MB = { f32: 240, q8: 146 };
-function updateLoadBtnLabel() {
-  const size = QUANT_SIZE_MB[quantSelect.value] ?? 240;
-  loadBtn.textContent = `Load Weights (${size}MB)`;
-}
-quantSelect.addEventListener('change', updateLoadBtnLabel);
-updateLoadBtnLabel();
 
 function log(msg) {
   statusEl.textContent = msg;
@@ -127,11 +277,29 @@ function resizeCanvas() {
 resizeCanvas();
 window.addEventListener('resize', resizeCanvas);
 
-function segmentColor(segIndex, totalSegs) {
+// The meter reads its colours from the stylesheet so it follows the theme
+// instead of pinning a dark-only palette. Re-read on every frame batch is
+// wasteful, so cache and refresh only when the colour scheme changes.
+let themeColors = readThemeColors();
+function readThemeColors() {
+  const cs = getComputedStyle(document.documentElement);
+  return {
+    bg: cs.getPropertyValue('--bg').trim() || '#0c0d10',
+    meter: cs.getPropertyValue('--meter').trim() || '#7c93f5',
+    off: cs.getPropertyValue('--meter-off').trim() || '#1c1f26',
+  };
+}
+matchMedia('(prefers-color-scheme: dark)')
+  .addEventListener('change', () => { themeColors = readThemeColors(); });
+
+// One accent hue, fading toward the top of the bar: quieter than a
+// red/amber/green ladder and it carries the same amplitude information.
+// Applied via globalAlpha rather than a color-mix() fillStyle, because an
+// unsupported colour function makes the assignment a silent no-op and the
+// whole meter then draws in whatever colour was set last.
+function segmentAlpha(segIndex, totalSegs) {
   const t = segIndex / (totalSegs - 1); // 0 = bottom, 1 = top
-  if (t < 0.1) return '#e03030';       // red
-  if (t < 0.25) return '#e07020';      // orange
-  return '#30c040';                     // green
+  return 1 - t * 0.45;
 }
 
 function makeAnalyser(ctx) {
@@ -148,7 +316,7 @@ function drawBars() {
 
   const w = canvas.width;
   const h = canvas.height;
-  canvasCtx.fillStyle = '#111';
+  canvasCtx.fillStyle = themeColors.bg;
   canvasCtx.fillRect(0, 0, w, h);
 
   if (!analyser) return;
@@ -178,16 +346,18 @@ function drawBars() {
 
     const x = i * barWidth + gap / 2;
 
+    canvasCtx.fillStyle = themeColors.meter;
     for (let s = 0; s < litSegs; s++) {
       const y = h - (s + 1) * segH + segGap / 2;
-      canvasCtx.fillStyle = segmentColor(s, SEG_COUNT);
+      canvasCtx.globalAlpha = segmentAlpha(s, SEG_COUNT);
       canvasCtx.fillRect(x, y, innerBarW, innerSegH);
     }
+    canvasCtx.globalAlpha = 1;
 
     // Draw dim segments above the lit ones
     for (let s = litSegs; s < SEG_COUNT; s++) {
       const y = h - (s + 1) * segH + segGap / 2;
-      canvasCtx.fillStyle = '#191919';
+      canvasCtx.fillStyle = themeColors.off;
       canvasCtx.fillRect(x, y, innerBarW, innerSegH);
     }
   }
@@ -207,22 +377,23 @@ const worker = new Worker('worker.js', { type: 'module' });
 
 let sampleRate = 24000;
 let audioCtx = null;
+let lastWavUrl = null;
+
+// Each live AudioContext holds a real-time audio render thread, and browsers cap
+// how many one page may have (Safari 4, Chrome 6). Creating one per generation
+// without closing the old one eventually refuses to construct at all, which in a
+// demo means the Generate button simply stops producing sound.
+function closeAudioContext(ctx) {
+  if (ctx && ctx.state !== 'closed') ctx.close().catch(() => {});
+}
 let nextStartTime = 0;
 let startTime = 0;
 let firstChunkTime = null;
 let allChunks = [];
 let generating = false;
+let modelReady = false;
 let replayAudioCtx = null;
 let replaySource = null;
-let cpuFeatures = {};
-
-function formatFeatures(f) {
-  // Show every flag with a clear on/off marker. Wasm builds normally
-  // only enable simd128, but listing avx/neon/f16c too makes it obvious
-  // when one of them is actually active (e.g. in a native re-build).
-  const flags = ['avx', 'neon', 'simd128', 'f16c'];
-  return 'CPU features: ' + flags.map(k => `${k}=${f[k] ? 'on' : 'off'}`).join(' ');
-}
 
 worker.onmessage = (e) => {
   const { type, ...data } = e.data;
@@ -233,12 +404,9 @@ worker.onmessage = (e) => {
       break;
 
     case 'progress':
-      if (data.pct >= 0) {
-        log(`${data.label}: ${data.pct}% (${data.detail})`);
-        showProgress(data.pct);
-      } else {
-        log(`${data.label}: ${data.detail}`);
-      }
+      // The bar carries the progress; the label just says what is happening.
+      log(data.label.startsWith('Voice') ? 'Preparing voices\u2026' : 'Downloading\u2026');
+      if (data.pct >= 0) showProgress(data.pct);
       break;
 
     case 'progress_done':
@@ -247,14 +415,18 @@ worker.onmessage = (e) => {
 
     case 'loaded':
       sampleRate = data.sampleRate;
-      cpuFeatures = data.features || {};
+      modelReady = true;
       loadBtn.style.display = 'none';
-      btn.style.display = '';
-      log(`Ready! Enter text and click Generate.\n${formatFeatures(cpuFeatures)}`);
+      // Voices belong to the checkpoint, so the list arrives with it.
+      voiceSelect.innerHTML = (data.voices ?? [])
+        .map((v, i) => `<option value="${v}"${i === 0 ? ' selected' : ''}>${v}</option>`)
+        .join('');
+      controls.hidden = false;
+      log('');
       break;
 
     case 'gen_start':
-      log(`Generating speech (${data.numTokens} tokens)...`);
+      log('Generating\u2026');
       break;
 
     case 'chunk': {
@@ -279,29 +451,14 @@ worker.onmessage = (e) => {
     }
 
     case 'done': {
-      const totalMs = performance.now() - startTime;
-      const totalTime = (totalMs / 1000).toFixed(2);
-      const totalSamples = allChunks.reduce((sum, c) => sum + c.length, 0);
-      const durationSec = totalSamples / sampleRate;
-      const duration = durationSec.toFixed(2);
-      const firstAudio = firstChunkTime != null ? (firstChunkTime / 1000).toFixed(2) : '?';
-      const rtf = totalMs > 0 ? (durationSec / (totalMs / 1000)).toFixed(3) : '?';
-      const promptMs = data.promptMs != null ? data.promptMs.toFixed(0) : '?';
-      const avgMs = data.stepMsAvg != null ? data.stepMsAvg.toFixed(1) : '?';
-      const minMs = data.stepMsMin != null ? data.stepMsMin.toFixed(1) : '?';
-      const maxMs = data.stepMsMax != null ? data.stepMsMax.toFixed(1) : '?';
-      const stats = [
-        `Generated ${duration}s of audio in ${totalTime}s (RTF=${rtf}, first audio: ${firstAudio}s)`,
-        `Text prompt: ${promptMs}ms`,
-        `Decode steps: ${data.numSteps ?? 0}, avg ${avgMs}ms (min ${minMs}, max ${maxMs})`,
-        formatFeatures(cpuFeatures),
-      ].join('\n');
-      log(stats);
+      log('');
 
       // Create WAV download/replay element
       const allPcm = concatenateChunks(allChunks);
       const wavBlob = encodeWav(allPcm, sampleRate);
+      if (lastWavUrl) URL.revokeObjectURL(lastWavUrl);
       const url = URL.createObjectURL(wavBlob);
+      lastWavUrl = url;
       const container = document.getElementById('audio-container');
       container.innerHTML = '';
       const audio = document.createElement('audio');
@@ -326,6 +483,7 @@ worker.onmessage = (e) => {
 
 function hookAudioElement(audio) {
   // Set up the audio graph eagerly so it's ready when the user hits play
+  closeAudioContext(replayAudioCtx);
   replayAudioCtx = new AudioContext({ sampleRate });
   const replayAnalyser = makeAnalyser(replayAudioCtx);
   replaySource = replayAudioCtx.createMediaElementSource(audio);
@@ -352,13 +510,12 @@ function concatenateChunks(chunks) {
 
 function loadWeights() {
   loadBtn.disabled = true;
-  quantSelect.disabled = true;
-  worker.postMessage({ type: 'load', voiceName: voiceSelect.value, quant: quantSelect.value });
+  worker.postMessage({ type: 'load' });
 }
 
 function generate() {
   const text = document.getElementById('text').value.trim();
-  if (!text || generating) return;
+  if (!text || generating || !modelReady) return;
 
   generating = true;
   btn.disabled = true;
@@ -366,8 +523,8 @@ function generate() {
   firstChunkTime = null;
   allChunks = [];
 
-  // Reset replay state since we're creating a new AudioContext
-  replayAudioCtx = null;
+  // This generation supersedes the previous one's playback context.
+  closeAudioContext(audioCtx);
   replaySource = null;
 
   // AudioContext must be created/resumed from a user gesture

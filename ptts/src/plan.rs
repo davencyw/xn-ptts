@@ -2,7 +2,7 @@
 //! when to stop.
 //!
 //! These rules were previously inlined — as literals — in every frontend: the
-//! `pocket_tts` example, `ptts-pyo3` (twice), `ptts-wasm` and `ptts-ws-server`
+//! `phonon` CLI, `ptts-pyo3` (twice), `ptts-wasm` and `ptts-ws-server`
 //! each carried their own copy of `((n / 3.0 + 2.0) * 12.5).ceil()` and their own
 //! EOS countdown loop. They are pure functions of the token count and the config,
 //! so they live here and are unit tested.

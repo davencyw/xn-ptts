@@ -2080,6 +2080,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "phonon-cli"
+version = "0.2.3"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ptts",
+ "tracing",
+ "tracing-subscriber",
+ "xn",
+]
+
+[[package]]
 name = "pin-project"
 version = "1.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2245,18 +2257,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ptts-cli"
-version = "0.2.3"
-dependencies = [
- "anyhow",
- "clap",
- "ptts",
- "tracing",
- "tracing-subscriber",
- "xn",
-]
-
-[[package]]
 name = "ptts-pyo3"
 version = "0.2.3"
 dependencies = [
@@ -2277,6 +2277,7 @@ dependencies = [
  "ptts",
  "rand",
  "rand_distr",
+ "serde_json",
  "wasm-bindgen",
  "xn",
 ]

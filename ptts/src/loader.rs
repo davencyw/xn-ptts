@@ -96,20 +96,41 @@ pub fn load_voice_emb<B: Backend>(
 /// Fails if the voice file records a `model_ext` other than `model_ext`. A file that records
 /// none is accepted: older voices predate the metadata.
 fn check_model_ext(path: &std::path::Path, model_ext: &str) -> Result<()> {
-    let header = read_safetensors_header(path)?;
-    let (_, metadata) =
-        safetensors::SafeTensors::read_metadata(&header).map_err(xn::Error::wrap)?;
-    if let Some(metadata) = metadata.metadata()
-        && let Some(voice_model_ext) = metadata.get("model_ext")
-    {
-        tracing::info!(?voice_model_ext, "voice embedding model_ext from metadata");
-        if voice_model_ext.as_str() != model_ext {
-            xn::bail!(
-                "voice embedding model_ext '{voice_model_ext}' does not match config model_ext '{model_ext}'"
-            )
-        }
+    let Some(voice_model_ext) = read_model_ext(path)? else { return Ok(()) };
+    tracing::info!(?voice_model_ext, "voice embedding model_ext from metadata");
+    if voice_model_ext != model_ext {
+        xn::bail!(
+            "voice embedding model_ext '{voice_model_ext}' does not match config model_ext '{model_ext}'"
+        )
     }
     Ok(())
+}
+
+/// The `__metadata__.model_ext` string a voice file records, if any.
+///
+/// Reads the header JSON directly rather than going through
+/// `SafeTensors::read_metadata`, which cannot be used here: it ends with
+///
+/// ```text
+/// if buffer_end + 8 + n != buffer_len { return Err(MetadataIncompleteBuffer) }
+/// ```
+///
+/// so it only accepts a buffer holding the tensor data as well, and rejects the
+/// header alone for every file that has any. Only `__metadata__` is wanted, and
+/// that lives in the header, so parse it there.
+fn read_model_ext(path: &std::path::Path) -> Result<Option<String>> {
+    #[derive(serde::Deserialize)]
+    struct Header {
+        #[serde(rename = "__metadata__", default)]
+        metadata: std::collections::HashMap<String, String>,
+    }
+
+    let header = read_safetensors_header(path)?;
+    let json = std::str::from_utf8(&header[8..])
+        .map_err(|e| xn::Error::msg(format!("{}: header is not utf-8: {e}", path.display())))?;
+    let header: Header = serde_json::from_str(json)
+        .map_err(|e| xn::Error::msg(format!("{}: bad safetensors header: {e}", path.display())))?;
+    Ok(header.metadata.get("model_ext").cloned())
 }
 
 /// Reads just enough of a safetensors file for `read_metadata`: the 8-byte
@@ -139,6 +160,77 @@ fn read_safetensors_header(path: &std::path::Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes a safetensors file holding one small tensor, plus whatever
+    /// `__metadata__` is given, and returns its path.
+    fn write_safetensors(
+        dir: &std::path::Path,
+        name: &str,
+        metadata: Option<&str>,
+    ) -> std::path::PathBuf {
+        let data = [0u8; 16];
+        let mut header = String::from("{");
+        if let Some(metadata) = metadata {
+            header.push_str(&format!("\"__metadata__\":{{\"model_ext\":\"{metadata}\"}},"));
+        }
+        header.push_str("\"emb\":{\"dtype\":\"F32\",\"shape\":[1,4],\"data_offsets\":[0,16]}}");
+        let path = dir.join(name);
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&data);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn voices_are_found_beside_the_weights_directory() {
+        let root = std::env::temp_dir().join("ptts-voice-layout-test");
+        std::fs::remove_dir_all(&root).ok();
+        let model = root.join("model");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::create_dir_all(root.join("voices")).unwrap();
+
+        // A layout with the weights in `model/` and the voices its sibling.
+        std::fs::write(model.join("model.q8.gguf"), b"not really a gguf").unwrap();
+        write_safetensors(&root.join("voices"), "Freya.safetensors", None);
+        write_safetensors(&root.join("voices"), "Zoey.safetensors", None);
+
+        let artifacts = resolve_dir(&model, 0.7).unwrap();
+        let names: Vec<&str> = artifacts.voices.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["Freya", "Zoey"]);
+
+        // A voice beside the weights shadows one of the same name a level up.
+        std::fs::create_dir_all(model.join("voices")).unwrap();
+        write_safetensors(&model.join("voices"), "Freya.safetensors", None);
+        let artifacts = resolve_dir(&model, 0.7).unwrap();
+        let freya = artifacts.voices.iter().find(|(n, _)| n == "Freya").unwrap();
+        assert!(freya.1.starts_with(&model), "expected {:?} under {:?}", freya.1, model);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `check_model_ext` used to hand a header-only buffer to
+    /// `SafeTensors::read_metadata`, which requires the tensor data to be
+    /// present too and so rejected every voice file that had any. It went
+    /// unnoticed because the only published config leaves `model_id` null,
+    /// making `model_ext` `None` and skipping the check entirely.
+    #[test]
+    fn model_ext_is_read_from_a_header_that_has_tensor_data() {
+        let dir = std::env::temp_dir().join("ptts-model-ext-test");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let tagged = write_safetensors(&dir, "tagged.safetensors", Some("a5e53131@800"));
+        assert_eq!(read_model_ext(&tagged).unwrap().as_deref(), Some("a5e53131@800"));
+        check_model_ext(&tagged, "a5e53131@800").unwrap();
+        assert!(check_model_ext(&tagged, "deadbeef@1").is_err());
+
+        // A file predating the metadata records none, and is accepted.
+        let untagged = write_safetensors(&dir, "untagged.safetensors", None);
+        assert_eq!(read_model_ext(&untagged).unwrap(), None);
+        check_model_ext(&untagged, "a5e53131@800").unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn remap_key_renames_and_drops() {
@@ -327,16 +419,29 @@ fn resolve_dir(dir: &std::path::Path, temperature: f32) -> Result<Artifacts> {
     let tokenizer =
         TOKENIZER_CANDIDATES.iter().map(|name| dir.join(name)).find(|path| path.is_file());
 
+    // Voices are looked for beside the weights and then one level up: a
+    // checkpoint is commonly laid out with `model/` holding the weights, config
+    // and tokenizer, and `voices/` a sibling of it rather than a child. Pointing
+    // `--dir` at the weights should still find them.
     let mut voices = vec![];
-    for sub in ["voices", "embeddings"] {
-        collect_voice_dir(&dir.join(sub), &mut voices);
+    let mut roots = vec![dir.to_path_buf()];
+    if let Some(parent) = dir.parent() {
+        roots.push(parent.to_path_buf());
+    }
+    for root in &roots {
+        for sub in ["voices", "embeddings"] {
+            collect_voice_dir(&root.join(sub), &mut voices);
+        }
     }
     let default_voice = dir.join("default-voice.safetensors");
     if default_voice.is_file() {
         voices.push(("default".to_string(), default_voice));
     }
+    // Retain before sorting: insertion order encodes precedence, so a voice
+    // beside the weights wins over one of the same name a level up.
+    let mut seen = std::collections::HashSet::new();
+    voices.retain(|(name, _)| seen.insert(name.clone()));
     voices.sort();
-    voices.dedup_by(|a, b| a.0 == b.0);
 
     Ok(Artifacts { config, weights, tokenizer, voices })
 }

@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name = "prep-voices"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+ptts = { path = "../../ptts", features = ["sp"] }
+xn = "0.2"
+anyhow = "1"
+serde_json = "1"
+
+[profile.release]
+debug = true

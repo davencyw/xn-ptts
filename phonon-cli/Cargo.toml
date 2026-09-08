@@ -1,20 +1,21 @@
 [package]
-name = "ptts-cli"
+name = "phonon-cli"
 version.workspace = true
 edition = "2024"
-description = "Command-line text-to-speech using Pocket TTS. Installs the `pocket-tts` binary."
+description = "Phonon: fast local text-to-speech on the command line. Installs the `phonon` binary."
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 license.workspace = true
-# The point of this crate is `cargo install ptts-cli`, so keep it a binary only:
-# no library target for anyone to depend on by accident. The crate is `ptts-cli`
-# because crates.io `pocket-tts` belongs to an unrelated project; the binary it
-# installs is still `pocket-tts`, which is what anyone actually types.
+# The point of this crate is `cargo install phonon-cli`, so keep it a binary
+# only: no library target for anyone to depend on by accident. The crate is
+# `phonon-cli` because crates.io `phonon` is taken by an unrelated audio crate
+# (a Steam Audio port); the binary it installs is `phonon`, which is the part
+# anyone actually types.
 autolib = false
 
 [[bin]]
-name = "pocket-tts"
+name = "phonon"
 path = "src/main.rs"
 
 [dependencies]

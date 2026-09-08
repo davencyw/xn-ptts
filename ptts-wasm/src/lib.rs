@@ -80,6 +80,20 @@ impl flow_lm::Rng for WasmRng {
     }
 }
 
+/// Mimi frames decoded per call once streaming is underway.
+///
+/// The vocoder is roughly three quarters of the per-frame cost, and inside
+/// `conv_transpose1d` a single frame makes the col2im gemm an `m = 1`
+/// matrix-vector product -- it streams the whole kernel from memory to produce
+/// one column. Decoding several frames at once turns each into a real matmul.
+/// Measured single-threaded (which is what wasm gets) on the 12-layer
+/// checkpoint: 10.12 ms/frame at 1, 8.09 at 4, 8.07 at 8, 8.34 at 16, so the
+/// curve is flat from 4 onwards and 8 sits at the bottom of it. Output is
+/// unchanged to within float rounding (max |diff| 3.4e-7), because the
+/// streaming convolution state makes a chunk of k frames equivalent to k
+/// single frames.
+const MIMI_CHUNK: usize = 8;
+
 /// Underlying type-erased transformer state, shared across all supported quantizations
 /// (all of them use `T = f32, B = CpuDevice`).
 type RawState = StreamingTransformerState<f32, CpuDevice>;
@@ -170,6 +184,11 @@ struct GenState {
     frames_after_eos: usize,
     eos_countdown: Option<usize>,
     step: usize,
+    /// Latents sampled but not yet handed to the vocoder.
+    pending: Vec<Tensor<f32, CpuDevice>>,
+    /// How many to accumulate before decoding. Starts at 1 so the first audio
+    /// still arrives after a single frame, then rises to `MIMI_CHUNK`.
+    chunk_target: usize,
 }
 
 #[wasm_bindgen]
@@ -182,10 +201,32 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new_(model_weights: &[u8], quant: &str) -> xn::Result<Model> {
+    pub fn new_(
+        model_weights: &[u8],
+        quant: &str,
+        config_json: Option<String>,
+    ) -> xn::Result<Model> {
         let quant = Quant::parse(quant)?;
         console_log!("[new] loading model with quant={quant:?}");
-        let cfg = TTSConfig::v202601(0.7);
+        // A checkpoint whose architecture differs from the published one ships a
+        // `config.json`; without one, fall back to the built-in config that
+        // describes the published checkpoint.
+        let cfg = match config_json.as_deref().map(str::trim) {
+            Some(json) if !json.is_empty() => {
+                let cfg: TTSConfig = serde_json::from_str(json)
+                    .map_err(|e| xn::Error::msg(format!("bad model config: {e}")))?;
+                console_log!(
+                    "[new] using supplied config: {} layers, d_model {}",
+                    cfg.flow_lm.num_layers,
+                    cfg.flow_lm.d_model
+                );
+                cfg
+            }
+            _ => {
+                console_log!("[new] using built-in v202601 config");
+                TTSConfig::v202601(0.7)
+            }
+        };
 
         let is_gguf = model_weights.len() >= 4 && &model_weights[..4] == b"GGUF";
         let vb = if is_gguf {
@@ -220,7 +261,17 @@ impl Model {
     pub fn add_voice_(&mut self, state_bytes: &[u8]) -> xn::Result<usize> {
         console_log!("[add_voice] loading safetensors, {} bytes", state_bytes.len());
         let tensors = xn::safetensors::load_from_buffer(state_bytes, &CPU)?;
-        let num_layers = 6;
+
+        // Two voice formats are in circulation. The published checkpoint ships
+        // precomputed KV caches, one per layer, which drop straight into a
+        // transformer state. Other checkpoints ship the conditioning embedding
+        // itself, which has to be run through `prompt_audio` first. Both end up
+        // as a cached state here, so generation does not care which it was.
+        if !tensors.contains_key("transformer.layers.0.self_attn/cache") {
+            return self.add_voice_from_emb(&tensors);
+        }
+
+        let num_layers = self.cfg.flow_lm.num_layers;
         let mut layer_states = Vec::with_capacity(num_layers);
 
         for i in 0..num_layers {
@@ -252,6 +303,52 @@ impl Model {
         }
 
         let raw = StreamingTransformerState { layer_states };
+        let idx = self.voice_states.len();
+        self.voice_states.push(raw);
+        Ok(idx)
+    }
+
+    /// Registers an embedding-style voice: one tensor of shape `[1, frames, dim]`
+    /// (or `[frames, dim]`), conditioned once here so that generation reuses the
+    /// resulting state exactly as it does for a precomputed one.
+    fn add_voice_from_emb(
+        &mut self,
+        tensors: &std::collections::HashMap<String, TypedTensor<CpuDevice>>,
+    ) -> xn::Result<usize> {
+        let mut names: Vec<&String> = tensors.keys().collect();
+        names.sort();
+        let key = match names.first() {
+            Some(k) => (*k).clone(),
+            None => xn::bail!("voice file holds no tensors"),
+        };
+        let emb = match tensors.get(&key) {
+            Some(TypedTensor::F32(t)) => t.clone(),
+            _ => xn::bail!("expected an f32 voice tensor, got {key}"),
+        };
+        let dims = emb.shape().dims().to_vec();
+        let emb = match dims.len() {
+            2 => emb.reshape((1, dims[0], dims[1]))?,
+            3 => emb,
+            n => xn::bail!("voice tensor {key} has rank {n}, expected 2 or 3"),
+        };
+        let (_, frames, dim) = emb.dims3()?;
+        console_log!("[add_voice] embedding voice {key}: {frames} frames, dim {dim}");
+
+        // `prompt_audio` appends exactly `frames` entries and nothing else, so
+        // that is the whole budget this cached state needs; `resize_state` grows
+        // it per generation.
+        let raw = match &self.inner {
+            ModelInner::F32(m) => {
+                let mut state = m.init_flow_lm_state(1, frames)?;
+                m.prompt_audio(&mut state, &emb)?;
+                state.flow_lm_state.transformer_state
+            }
+            ModelInner::Q8(m) => {
+                let mut state = m.init_flow_lm_state(1, frames)?;
+                m.prompt_audio(&mut state, &emb)?;
+                state.flow_lm_state.transformer_state
+            }
+        };
         let idx = self.voice_states.len();
         self.voice_states.push(raw);
         Ok(idx)
@@ -311,6 +408,8 @@ impl Model {
             frames_after_eos,
             eos_countdown: None,
             step: 0,
+            pending: Vec::with_capacity(MIMI_CHUNK),
+            chunk_target: 1,
         });
         Ok(())
     }
@@ -325,13 +424,9 @@ impl Model {
             return Ok(None);
         }
 
-        let (next_latent, audio_chunk, is_eos) =
-            dispatch!(&self.inner, &mut state.tts_state, |m, s| {
-                let (next_latent, is_eos) =
-                    m.generate_step(s, &state.prev_latent, &mut state.rng)?;
-                let audio_chunk = m.decode_latent(&next_latent, &mut state.mimi_state)?;
-                (next_latent, audio_chunk, is_eos)
-            });
+        let (next_latent, is_eos) = dispatch!(&self.inner, &mut state.tts_state, |m, s| {
+            m.generate_step(s, &state.prev_latent, &mut state.rng)?
+        });
 
         if is_eos && state.eos_countdown.is_none() {
             state.eos_countdown = Some(state.frames_after_eos);
@@ -348,12 +443,29 @@ impl Model {
             false
         };
 
+        state.pending.push(next_latent.clone());
         state.prev_latent = next_latent;
         state.step += 1;
 
-        let audio = audio_chunk.narrow(0, ..1)?.contiguous()?;
-        let pcm = audio.to_vec()?;
-        let result = js_sys::Float32Array::from(pcm.as_slice());
+        // Anything still pending has to come out on the last step, or the tail
+        // of the utterance is dropped.
+        let flush = done || state.step >= state.max_frames;
+        let result = if state.pending.len() >= state.chunk_target || flush {
+            let refs: Vec<&Tensor<f32, CpuDevice>> = state.pending.iter().collect();
+            let batched = Tensor::cat(&refs, 1)?;
+            let audio_chunk = dispatch!(&self.inner, &mut state.tts_state, |m, _s| {
+                m.decode_latent(&batched, &mut state.mimi_state)?
+            });
+            state.pending.clear();
+            state.chunk_target = MIMI_CHUNK;
+
+            let audio = audio_chunk.narrow(0, ..1)?.contiguous()?;
+            js_sys::Float32Array::from(audio.to_vec()?.as_slice())
+        } else {
+            // Sampled but not yet decoded: an empty array keeps the caller's
+            // loop going without handing it a frame of silence.
+            js_sys::Float32Array::new_with_length(0)
+        };
 
         if !done {
             self.gen_state = Some(state);
@@ -366,8 +478,12 @@ impl Model {
 #[wasm_bindgen]
 impl Model {
     #[wasm_bindgen(constructor)]
-    pub fn new(model_weights: &[u8], quant: &str) -> Result<Model, JsError> {
-        Self::new_(model_weights, quant).map_err(|e| JsError::new(&e.to_string()))
+    pub fn new(
+        model_weights: &[u8],
+        quant: &str,
+        config_json: Option<String>,
+    ) -> Result<Model, JsError> {
+        Self::new_(model_weights, quant, config_json).map_err(|e| JsError::new(&e.to_string()))
     }
 
     pub fn add_voice(&mut self, voice_weights: &[u8]) -> Result<usize, JsError> {

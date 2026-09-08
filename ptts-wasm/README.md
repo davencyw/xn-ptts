@@ -1,8 +1,9 @@
-# wasm-pocket-tts
+# Phonon for the browser
 
-WebAssembly build of [Pocket TTS](../ptts/) — run text-to-speech directly in the browser.
+WebAssembly build of [Phonon](../) — text to speech running client-side, on the CPU, with no
+server in the loop. The model is Kyutai's Pocket TTS.
 
-Try it online [here](https://laurentmazare.github.io/pocket-tts).
+Upstream hosts a demo of the same model [here](https://laurentmazare.github.io/pocket-tts).
 
 ## Prerequisites
 

@@ -1,12 +1,12 @@
 //! Text to speech on the command line.
 //!
 //! ```text
-//! cargo install ptts-cli
-//! pocket-tts "hello world" -o out.wav
+//! cargo install phonon-cli
+//! phonon "hello world" -o out.wav
 //! ```
 //!
-//! The crate is `ptts-cli` but the binary is `pocket-tts`: crates.io
-//! `pocket-tts` belongs to an unrelated project.
+//! The crate is `phonon-cli` but the binary is `phonon`: crates.io `phonon` is
+//! taken by an unrelated audio crate.
 //!
 //! This is a front end and nothing else: every decision about how speech gets
 //! made lives in `ptts::synth::Synth`. What is here is argument parsing, the
@@ -18,7 +18,7 @@ use ptts::synth::{DeviceKind, Quant, SpeechOptions, Synth};
 use std::str::FromStr;
 
 #[derive(Parser, Debug)]
-#[command(name = "pocket-tts", version, about = "Generate speech from text using Pocket TTS")]
+#[command(name = "phonon", version, about = "Generate speech from text, locally")]
 struct Args {
     /// Text to synthesize.
     text: String,

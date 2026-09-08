@@ -1,17 +1,30 @@
 import init, { Model, cpu_features } from './ptts_wasm.js';
 
-const HF_BASE = 'https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/main';
-const HF_BASE_Q8 = 'https://huggingface.co/lmz/pocket-tts-without-voice-cloning-q8/resolve/main';
-const TOKENIZER_URL = `${HF_BASE}/tokenizer.model`;
+// The Phonon checkpoint is not published, so it is served from the same origin
+// as the page: point a static server at the model repo (scratch/wasm-lan does
+// this with --models). Swap in a URL once it is hosted.
+// The Phonon checkpoint is not published, so it is served from the same origin
+// as the page: point a static server at the model repo (scratch/wasm-lan does
+// this with --models). Swap in a URL once it is hosted.
+const MODEL_BASE = '/models';
 
-function modelUrl(quant) {
-  if (quant === 'q8') return `${HF_BASE_Q8}/tts_b6369a24.gguf`;
-  return `${HF_BASE}/tts_b6369a24.safetensors`;
-}
-
-function voiceUrl(name) {
-  return `${HF_BASE}/embeddings_v2/${name}.safetensors`;
-}
+const CHECKPOINT = {
+  label: 'Phonon',
+  quant: 'q8',
+  model: `${MODEL_BASE}/model/model.q8.gguf`,
+  tokenizer: `${MODEL_BASE}/model/tokenizer.model`,
+  // This checkpoint's architecture differs from the one built into the wasm
+  // module, so its config travels with it and is parsed at load.
+  config: `${MODEL_BASE}/model/config.json`,
+  // Precomputed conditioning (scratch/prep-voices), not raw embeddings. An
+  // embedding has to be run through `prompt_audio` before it can be used --
+  // a 125-frame prefill through the whole backbone, per voice. Doing eight of
+  // those on a phone at page load burns the thermal budget before the user has
+  // asked for any speech, so the browser loads a finished KV cache instead and
+  // does no arithmetic at all to register a voice.
+  voiceDir: `${MODEL_BASE}/voices-prepared`,
+  voices: ['Archie', 'Damon', 'Elodie-Rose', 'Freddie', 'Freya', 'Garrett', 'Marlowe', 'Zoey'],
+};
 
 function post(type, data = {}, transferables = []) {
   self.postMessage({ type, ...data }, transferables);
@@ -201,8 +214,6 @@ class UnigramTokenizer {
 }
 
 // ---- Worker state ----
-const VOICE_NAMES = ['alba', 'marius', 'javert', 'fantine', 'cosette', 'eponine', 'azelma'];
-
 // Start WASM compilation immediately so the optimizing compiler (TurboFan)
 // finishes well before the first generation runs.
 const wasmModulePromise = WebAssembly.compileStreaming(fetch('ptts_wasm_bg.wasm'));
@@ -211,34 +222,54 @@ let model = null;
 let tokenizer = null;
 let voiceIndexMap = {};
 
-async function handleLoad(quant) {
+async function handleLoad() {
+  const ckpt = CHECKPOINT;
   const wasmModule = await wasmModulePromise;
   await init(wasmModule);
   post('status', { message: 'WASM initialized. Downloading tokenizer and model...' });
 
-  const tokData = await fetchWithProgress(TOKENIZER_URL, 'Tokenizer');
+  const tokData = await fetchWithProgress(ckpt.tokenizer, 'Tokenizer');
   const pieces = decodeSentencepieceModel(tokData);
   tokenizer = new UnigramTokenizer(pieces);
   post('status', { message: `Tokenizer loaded (${pieces.length} pieces)` });
 
-  const modelWeights = await fetchWithProgress(modelUrl(quant), 'Model weights');
-
-  post('status', { message: `Initializing model (quant=${quant})...` });
-  model = new Model(modelWeights, quant);
-
-  for (const name of VOICE_NAMES) {
-    post('status', { message: `Loading voice: ${name}...` });
-    const voiceData = await fetchWithProgress(voiceUrl(name), `Voice: ${name}`);
-    voiceIndexMap[name] = model.add_voice(voiceData);
+  // Fetched before the weights: a checkpoint that needs a config and cannot get
+  // one would otherwise download hundreds of megabytes and then fail to load.
+  let configJson = null;
+  if (ckpt.config) {
+    const resp = await fetch(ckpt.config);
+    if (!resp.ok) throw new Error(`Failed to fetch ${ckpt.config}: ${resp.status}`);
+    configJson = await resp.text();
   }
+
+  const modelWeights = await fetchWithProgress(ckpt.model, 'Model weights');
+
+  post('status', { message: `Initializing ${ckpt.label}...` });
+  model = new Model(modelWeights, ckpt.quant, configJson);
+
+  // Voices are fetched on first use, not here: one is ~9 MB and the user only
+  // ever hears one at a time, so loading eight would cost bandwidth and delay
+  // the first generation for nothing.
+  voiceIndexMap = {};
 
   const sampleRate = model.sample_rate();
   const features = cpu_features();
-  post('loaded', { sampleRate, features });
+  post('loaded', { sampleRate, features, voices: ckpt.voices });
+}
+
+async function ensureVoice(name) {
+  if (voiceIndexMap[name] !== undefined) return voiceIndexMap[name];
+  const url = `${CHECKPOINT.voiceDir}/${name}.safetensors`;
+  const data = await fetchWithProgress(url, `Voice: ${name}`);
+  // Registering a precomputed voice is a tensor copy, not a prefill.
+  voiceIndexMap[name] = model.add_voice(data);
+  return voiceIndexMap[name];
 }
 
 async function handleGenerate(text, voiceName, temperature) {
-  const voiceIndex = voiceIndexMap[voiceName];
+  if (!model) throw new Error('model is not loaded yet');
+  if (!voiceName) throw new Error('no voice selected');
+  const voiceIndex = await ensureVoice(voiceName);
 
   const [processedText, framesAfterEos] = model.prepare_text(text);
   const tokenIds = tokenizer.encode(processedText);
@@ -260,6 +291,9 @@ async function handleGenerate(text, voiceName, temperature) {
     const chunk = model.generation_step();
     const dt = performance.now() - t0;
     if (!chunk) break;
+    // A step that only sampled -- the vocoder decodes a batch of frames at a
+    // time -- yields no audio yet, so there is nothing to hand over.
+    if (chunk.length === 0) { stepMsTotal += dt; continue; }
     stepMsTotal += dt;
     if (dt < stepMsMin) stepMsMin = dt;
     if (dt > stepMsMax) stepMsMax = dt;
@@ -282,7 +316,7 @@ self.onmessage = async (e) => {
   const { type, ...data } = e.data;
   try {
     if (type === 'load') {
-      await handleLoad(data.quant || 'f32');
+      await handleLoad();
     } else if (type === 'generate') {
       await handleGenerate(data.text, data.voiceName, data.temperature);
     }

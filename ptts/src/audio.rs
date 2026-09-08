@@ -2,7 +2,7 @@
 //!
 //! [`crate::synth::Synth::add_voice_from_pcm`] wants mono `f32` at the speaker
 //! codec's sample rate, which means decoding a file and resampling it. Both the
-//! `pocket-tts` CLI and the `create_voice` example need exactly that, so it
+//! `phonon` CLI and the `create_voice` example need exactly that, so it
 //! lives here rather than being copied into each.
 //!
 //! Behind the `audio` feature: `symphonia` and `rubato` are large and neither

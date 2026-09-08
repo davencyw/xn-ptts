@@ -49,7 +49,7 @@ struct Args {
     #[arg(long)]
     threads: Option<usize>,
 
-    #[arg(long, short, default_value = "Hello, this is a test of the pocket TTS system.")]
+    #[arg(long, short, default_value = "Hello, this is a test of the Phonon speech system.")]
     input: String,
 
     #[arg(long, default_value_t = 0.4)]
@@ -278,7 +278,7 @@ impl Bench<'_> {
         let load_ms = ms(t_load.elapsed());
 
         // Tokenize up front: the loop needs the tokens anyway, and the KV cache is sized from
-        // them. Long inputs are split into sentences, as `pocket_tts` does.
+        // them. Long inputs are split into sentences, as the `phonon` CLI does.
         let input = match args.lang.as_deref() {
             None => std::borrow::Cow::Borrowed(args.input.as_str()),
             Some(lang) => {
