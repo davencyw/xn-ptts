@@ -230,19 +230,28 @@ fn main() -> Result<()> {
         run_cpu(args)?;
     }
 
-    tracing::info!("peak RSS: {:.2} MB", peak_rss_mb());
+    match peak_rss_mb() {
+        Some(mb) => tracing::info!("peak RSS: {mb:.2} MB"),
+        None => tracing::info!("peak RSS: unavailable on this platform"),
+    }
 
     Ok(())
 }
 
-fn peak_rss_mb() -> f64 {
+#[cfg(unix)]
+fn peak_rss_mb() -> Option<f64> {
     let mut usage = std::mem::MaybeUninit::uninit();
     let maxrss = unsafe {
         libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr());
         usage.assume_init().ru_maxrss as f64
     };
     // ru_maxrss is in bytes on macOS but kilobytes on Linux.
-    if cfg!(target_os = "macos") { maxrss / (1024.0 * 1024.0) } else { maxrss / 1024.0 }
+    Some(if cfg!(target_os = "macos") { maxrss / (1024.0 * 1024.0) } else { maxrss / 1024.0 })
+}
+
+#[cfg(not(unix))]
+fn peak_rss_mb() -> Option<f64> {
+    None
 }
 
 enum Rng {
