@@ -7,13 +7,7 @@
 //! Available with the `hf` feature.
 
 /// A Hugging Face tokenizer.
-pub struct Tok(Box<tokenizers::Tokenizer>);
-
-impl From<tokenizers::Tokenizer> for Tok {
-    fn from(tok: tokenizers::Tokenizer) -> Self {
-        Tok(Box::new(tok))
-    }
-}
+pub struct Tok(tokenizers::Tokenizer);
 
 impl Tok {
     /// Opens a `tokenizer.json`. A SentencePiece `.model` path — or a missing `tokenizer.json`
@@ -30,8 +24,16 @@ impl Tok {
             }
         }
         tracing::info!(?path, "loading Hugging Face tokenizer");
-        let tok = tokenizers::Tokenizer::from_file(path).map_err(xn::Error::wrap)?;
-        Ok(Tok::from(tok))
+        let tok = tokenizers::Tokenizer::from_file(path)
+            .map_err(|e| xn::Error::wrap(e).with_path(path))?;
+        Ok(Tok(tok))
+    }
+
+    /// Loads the contents of a `tokenizer.json`, for callers with no filesystem to read it from
+    /// (the wasm demo fetches it over the network).
+    pub fn from_bytes(json: &[u8]) -> xn::Result<Self> {
+        let tok = tokenizers::Tokenizer::from_bytes(json).map_err(xn::Error::wrap)?;
+        Ok(Tok(tok))
     }
 }
 
@@ -57,6 +59,16 @@ impl crate::Tokenizer for Tok {
 
 #[cfg(test)]
 mod tests {
+    const MINIMAL: &str = r#"{"version":"1.0","added_tokens":[],
+      "model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0.0],["ab",-1.0],["c",-2.0]]}}"#;
+
+    #[test]
+    fn from_bytes_reads_a_tokenizer_json() {
+        use crate::Tokenizer as _;
+        let tok = super::Tok::from_bytes(MINIMAL.as_bytes()).unwrap();
+        assert_eq!(tok.encode("abc").unwrap(), [1, 2]);
+    }
+
     #[test]
     fn sentencepiece_models_point_at_the_converter() {
         let err = super::Tok::open(std::path::Path::new("weights/tokenizer.model"))

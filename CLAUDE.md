@@ -81,7 +81,7 @@ The library implements Pocket TTS: text → tokens → flow-matching language mo
 `ptts/src/lib.rs` exposes a single `Tokenizer` trait (`encode` / `decode`) so each binding plugs in its own implementation:
 
 - `pocket_tts` example, `ptts-pyo3` and `ptts-ws-server`: `ptts::tok::Tok` (the `hf` feature), a Hugging Face `tokenizers` wrapper.
-- `ptts-wasm`: `PresetTokenizer` — JS tokenizes in the browser and pushes IDs into the Rust state before each step.
+- `ptts-wasm`: the same `ptts::tok::Tok`, built from the `tokenizer.json` the demo fetches and handed to `Model::new`; the browser passes text, not token ids.
 
 There is no SentencePiece dependency: every Rust frontend loads a `tokenizer.json` and nothing else. The published checkpoints ship a SentencePiece `tokenizer.model` instead, so it has to be converted once with `scripts/convert-tokenizer.py`, which emits an equivalent `tokenizer.json` (identical ids, verified against `sentencepiece` as it converts). No tokenizer is bundled or defaulted to — every checkpoint has its own vocabulary, and loading the wrong one yields plausible audio from the wrong ids — so `Tok::open` refuses a `.model` path, and a missing `tokenizer.json` next to one, with a pointer at the script. `pocket_tts --tokenizer <path>` points the example at a converted file; `ptts-pyo3` and `ptts-ws-server` expect `tokenizer.json` in the HF repo or beside the config.
 

@@ -83,7 +83,7 @@ enum Voice {
     Audio(String),
 }
 
-fn download_files(voice: &str) -> Result<(std::path::PathBuf, std::path::PathBuf, Voice)> {
+fn download_files(voice: &str) -> Result<(std::path::PathBuf, Option<std::path::PathBuf>, Voice)> {
     use hf_hub::{Repo, RepoType, api::sync::Api};
     let repo_id = "kyutai/pocket-tts";
     tracing::info!(?repo_id, "downloading weights...");
@@ -93,12 +93,9 @@ fn download_files(voice: &str) -> Result<(std::path::PathBuf, std::path::PathBuf
     let model_path = repo.get("tts_b6369a24.safetensors").context("model weights not found")?;
     tracing::info!(?model_path, "model weights downloaded");
 
-    // The repo ships a SentencePiece `tokenizer.model`, which needs converting once; `--tokenizer`
-    // then points at the result.
-    let tokenizer_path = repo.get("tokenizer.json").context(
-        "no tokenizer.json in the repo: convert its tokenizer.model with \
-         `uv run scripts/convert-tokenizer.py` and pass the result with --tokenizer",
-    )?;
+    // The repo ships a SentencePiece `tokenizer.model`, which needs converting once, so a
+    // `tokenizer.json` is not there to be had yet; `--tokenizer` points at the converted one.
+    let tokenizer_path = repo.get("tokenizer.json").ok();
     tracing::info!(?tokenizer_path, "tokenizer downloaded");
 
     let voice = if VOICES.contains(&voice) {
@@ -313,7 +310,7 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
                 None => parent.join("model.safetensors"),
                 Some(p) => std::path::PathBuf::from_str(p)?,
             };
-            let tokenizer_path = parent.join("tokenizer.json");
+            let tokenizer_path = Some(parent.join("tokenizer.json"));
             tracing::info!(?config, "using local config");
             let config: ptts::tts_model::TTSConfig =
                 serde_json::from_str(&std::fs::read_to_string(config)?)?;
@@ -344,7 +341,11 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
         }
     };
 
-    let tokenizer = Tok::open(args.tokenizer.as_deref().unwrap_or(&tokenizer_path))?;
+    let tokenizer_path = args.tokenizer.as_deref().or(tokenizer_path.as_deref()).context(
+        "no tokenizer.json alongside the weights: convert the checkpoint's tokenizer.model with \
+         `uv run scripts/convert-tokenizer.py` and pass the result with --tokenizer",
+    )?;
+    let tokenizer = Tok::open(tokenizer_path)?;
     let text = match args.lang.as_deref() {
         None => std::borrow::Cow::Borrowed(args.text.as_str()),
         Some(lang) => {
