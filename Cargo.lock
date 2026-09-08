@@ -2237,6 +2237,7 @@ dependencies = [
  "serde",
  "serde_json",
  "symphonia",
+ "tokenizers",
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",

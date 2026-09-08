@@ -5,7 +5,6 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ptts::tts_model::MimiEnc;
 use xn::Tensor;
-use xn::nn::VB;
 
 #[derive(Parser, Debug)]
 #[command(name = "create-voice")]
@@ -23,33 +22,6 @@ struct Args {
     /// Voice to use
     #[arg(long)]
     input: String,
-}
-
-fn remap_key(name: &str) -> Option<String> {
-    // Skip keys we don't need
-    if name.contains("flow.w_s_t")
-        || name.contains("quantizer.vq")
-        || name.contains("quantizer.logvar_proj")
-    {
-        return None;
-    }
-
-    let mut name = name.to_string();
-
-    // Order matters: more specific replacements first
-    name = name.replace(
-        "flow_lm.condition_provider.conditioners.speaker_wavs.output_proj.weight",
-        "flow_lm.speaker_proj_weight",
-    );
-    name = name.replace(
-        "flow_lm.condition_provider.conditioners.transcript_in_segment.",
-        "flow_lm.conditioner.",
-    );
-    name = name.replace("flow_lm.backbone.", "flow_lm.transformer.");
-    name = name.replace("flow_lm.flow.", "flow_lm.flow_net.");
-    name = name.replace("mimi.model.", "mimi.");
-
-    Some(name)
 }
 
 fn main() -> Result<()> {
@@ -99,24 +71,17 @@ fn run(args: Args) -> Result<()> {
         pcm
     };
     tracing::info!("loaded audio with {} samples", pcm.len());
-    // Trim it to 10s max.
-    let pcm = if pcm.len() > speaker_sr * 10 {
-        tracing::info!("trimming audio to 10 seconds");
-        pcm[..speaker_sr * 10].to_vec()
+    let max_len = (speaker_sr as f32 * cfg.audio_prompt_max_duration).round() as usize;
+    let pcm = if pcm.len() > max_len {
+        tracing::info!(max_duration = cfg.audio_prompt_max_duration, "trimming audio");
+        pcm[..max_len].to_vec()
     } else {
         pcm
     };
     let pcm_tensor = Tensor::from_vec(pcm, (1, 1, ()), &dev)?.to::<f32>()?;
 
     tracing::info!(?model_path, "loading model");
-    let vb = if model_path.extension().and_then(|v| v.to_str()) == Some("gguf") {
-        let reader = std::fs::File::open(&model_path)?;
-        let reader = std::io::BufReader::new(reader);
-        VB::load_gguf_with_key_map(reader, dev, remap_key)?
-    } else {
-        VB::load_with_key_map(&[&model_path], dev, remap_key)?
-    };
-    let vb = vb.root();
+    let vb = ptts::checkpoint::load_var_builder(&model_path, dev)?.root();
     let mimi_enc: MimiEnc<xn::Unquantized<f32, xn::CpuDevice>> = MimiEnc::load(&vb, &cfg)?;
     tracing::info!("encoding audio to latent");
     let emb = mimi_enc.encode_audio(&pcm_tensor)?;

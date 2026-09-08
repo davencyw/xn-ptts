@@ -1,3 +1,39 @@
+//! Pocket TTS: text to 24 kHz speech, on device.
+//!
+//! Text is tokenized, a flow-matching language model turns the tokens into Mimi
+//! codec latents, and the Mimi decoder turns those into PCM. Generation is
+//! streaming throughout: latents are decoded as they are produced.
+//!
+//! # Getting started
+//!
+//! [`synth::Synth`] is the whole pipeline behind one call:
+//!
+//! ```no_run
+//! # fn main() -> xn::Result<()> {
+//! let tts = ptts::synth::Synth::from_hub()?;
+//! let pcm = tts.say("Hello world")?;
+//! ptts::wav::write_wav_file("out.wav", &pcm, tts.sample_rate() as u32)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Layers
+//!
+//! | Module | Role |
+//! |---|---|
+//! | [`synth`] | The one-call API: load, prime, generate, decode. Start here. |
+//! | [`checkpoint`] | Locating weights, the published-name mapping, voice files. |
+//! | [`plan`] | Frame and KV budgets, the end-of-speech policy. |
+//! | [`tts_model`] | [`tts_model::TTSModel`], the streaming primitives `synth` drives. |
+//! | [`flow_lm`], [`transformer`] | The token-conditioned flow-matching LM. |
+//! | [`mimi`], [`seanet`] | The neural audio codec. |
+//!
+//! Callers that need to drive generation themselves — a browser build stepping
+//! from an event loop, a server interleaving requests — should use
+//! [`tts_model::TTSModel`] directly. `Synth` is a composition of those
+//! primitives, not a replacement for them.
+
+pub mod checkpoint;
 pub mod conditioners;
 pub mod conv;
 pub mod dummy_quantizer;
@@ -5,9 +41,13 @@ pub mod flow_lm;
 pub mod layer_scale;
 pub mod mimi;
 pub mod mlp;
+pub mod plan;
 pub mod resample;
+pub mod rng;
 pub mod rope;
 pub mod seanet;
+pub mod synth;
+pub mod tok;
 pub mod transformer;
 pub mod tts_model;
 pub mod utils;
