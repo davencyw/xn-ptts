@@ -47,7 +47,7 @@ required-features = ["hf"]
 
 [[example]]
 name = "bench"
-required-features = ["sp"]
+required-features = ["hf"]
 
 [[example]]
 name = "quantize"
