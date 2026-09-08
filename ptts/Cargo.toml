@@ -27,10 +27,12 @@ clap = { workspace = true }
 half = { workspace = true }
 hf-hub = { workspace = true }
 rubato = { workspace = true }
-libc = { workspace = true }
 serde_json = { workspace = true }
 symphonia = { workspace = true }
 tracing-chrome = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
 
 [features]
 default = []
