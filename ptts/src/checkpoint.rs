@@ -72,6 +72,9 @@ pub fn is_optional_tensor(name: &str) -> bool {
         || name.starts_with("mimi.encoder")
         || name.starts_with("mimi.quantizer")
         || name.starts_with("mimi.downsample.")
+        // A checkpoint with a dedicated speaker codec (`TTSConfig::speaker_mimi`) ships it
+        // under its own prefix; only its encoder is ever loaded, and only for voice cloning.
+        || name.starts_with("speaker_mimi")
 }
 
 /// Open `path` as a var builder, dispatching on the file extension: `.gguf`
@@ -419,6 +422,10 @@ mod tests {
             "mimi.encoder.0.weight",
             "mimi.quantizer.output_proj.weight",
             "mimi.downsample.conv.conv.weight",
+            // Added by the separate-speaker-Mimi checkpoints; upstream's
+            // `model_helpers::is_unused_by_tts_model` carries this arm too.
+            "speaker_mimi.decoder.0.weight",
+            "speaker_mimi.quantizer.output_proj.weight",
         ] {
             assert!(is_optional_tensor(name), "{name} should be optional");
         }
