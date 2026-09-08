@@ -2245,6 +2245,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ptts-cli"
+version = "0.2.3"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ptts",
+ "tracing",
+ "tracing-subscriber",
+ "xn",
+]
+
+[[package]]
 name = "ptts-pyo3"
 version = "0.2.3"
 dependencies = [

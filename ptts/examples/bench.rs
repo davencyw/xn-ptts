@@ -74,6 +74,29 @@ struct Args {
     /// Off by default so measurements stay comparable with runs that predate the flag.
     #[arg(long)]
     lang: Option<String>,
+
+    /// Replay noise from a JSON array of floats instead of sampling it, so a run can be
+    /// compared against the reference implementation step for step. Ignores `--seed` and
+    /// `--temperature`, and makes the timings the only thing that varies between iterations.
+    #[arg(long)]
+    rng_values: Option<std::path::PathBuf>,
+
+    /// Write a Chrome trace of the run to ./trace-<timestamp>.json.
+    #[arg(long)]
+    chrome_tracing: bool,
+}
+
+/// The noise source for one iteration: sampled, or replayed from a file.
+///
+/// A fresh one is built per iteration so every iteration sees the same sequence.
+fn rng_for(args: &Args) -> Result<Box<dyn ptts::flow_lm::Rng + Send>> {
+    match args.rng_values.as_ref() {
+        None => Ok(Box::new(NormalRng::new(args.temperature, args.seed)?)),
+        Some(path) => {
+            let values: Vec<f32> = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+            Ok(Box::new(ptts::flow_lm::ReplayRng::new(values)?))
+        }
+    }
 }
 
 /// One iteration's timings.
@@ -101,7 +124,7 @@ fn one<Q: BackendQ>(
 ) -> Result<Run> {
     let dev = model.device();
     let ldim = model.flow_lm.ldim;
-    let mut rng = NormalRng::new(args.temperature, args.seed)?;
+    let mut rng = rng_for(args)?;
     let mut frames = Vec::new();
     let mut sample_t = Vec::new();
     let mut decode_t = Vec::new();
@@ -145,6 +168,44 @@ fn one<Q: BackendQ>(
     let total = start.elapsed();
     let ttfa = ttfa.context("no audio produced")?;
     Ok(Run { ttfa, frames, sample_t, decode_t, total, samples })
+}
+
+/// Peak resident set size, or `None` on platforms with no `getrusage`.
+///
+/// Moved here from the old `pocket_tts` example: how much memory a checkpoint
+/// needs is a measurement, so it belongs with the other measurements.
+#[cfg(unix)]
+fn peak_rss_mb() -> Option<f64> {
+    let mut usage = std::mem::MaybeUninit::uninit();
+    let maxrss = unsafe {
+        libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr());
+        usage.assume_init().ru_maxrss as f64
+    };
+    // ru_maxrss is in bytes on macOS but kilobytes on Linux.
+    Some(if cfg!(target_os = "macos") { maxrss / (1024.0 * 1024.0) } else { maxrss / 1024.0 })
+}
+
+#[cfg(not(unix))]
+fn peak_rss_mb() -> Option<f64> {
+    None
+}
+
+/// Bench prints its own tables to stdout, so `tracing` is only wired up when a
+/// Chrome trace is asked for — where the point is the span timings, not the logs.
+fn init_tracing(chrome_tracing: bool) -> Option<tracing_chrome::FlushGuard> {
+    use tracing_subscriber::{EnvFilter, prelude::*};
+
+    if !chrome_tracing {
+        return None;
+    }
+    let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new().build();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::Layer::new().with_target(false).with_writer(std::io::stderr))
+        .with(chrome_layer)
+        .with(filter)
+        .init();
+    Some(guard)
 }
 
 fn ms(d: Duration) -> f64 {
@@ -310,6 +371,12 @@ impl Bench<'_> {
         ] {
             row(label, unit, prec, &Stats::of(xs));
         }
+        // A single high-water mark for the whole process, so it is printed apart
+        // from the per-iteration statistics above.
+        if let Some(rss_mb) = peak_rss_mb() {
+            println!();
+            println!("peak RSS {rss_mb:.1} MB");
+        }
         Ok(())
     }
 }
@@ -318,6 +385,8 @@ fn main() -> Result<()> {
     use std::str::FromStr;
 
     let args = Args::parse();
+    // Held to the end of main: the guard flushes the trace on drop.
+    let _trace = init_tracing(args.chrome_tracing);
     if let Some(threads) = args.threads {
         // Must happen before the first tensor op, since it sets the size of rayon's global pool.
         xn::set_num_threads(threads);
