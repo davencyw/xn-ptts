@@ -4,6 +4,7 @@
 //! rename the same checkpoint keys, skip the same unused tensors and unpack voice files the same
 //! way. Keeping that here means a checkpoint layout change is one edit rather than four.
 
+use crate::tts_model::TTSConfig;
 use xn::nn::{Path, VB};
 use xn::{Backend, BackendQ, Result, Tensor};
 
@@ -95,9 +96,9 @@ pub fn load_voice_emb<B: Backend>(
 /// Fails if the voice file records a `model_ext` other than `model_ext`. A file that records
 /// none is accepted: older voices predate the metadata.
 fn check_model_ext(path: &std::path::Path, model_ext: &str) -> Result<()> {
-    let file_content = std::fs::read(path)?;
+    let header = read_safetensors_header(path)?;
     let (_, metadata) =
-        safetensors::SafeTensors::read_metadata(&file_content).map_err(xn::Error::wrap)?;
+        safetensors::SafeTensors::read_metadata(&header).map_err(xn::Error::wrap)?;
     if let Some(metadata) = metadata.metadata()
         && let Some(voice_model_ext) = metadata.get("model_ext")
     {
@@ -109,6 +110,30 @@ fn check_model_ext(path: &std::path::Path, model_ext: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Reads just enough of a safetensors file for `read_metadata`: the 8-byte
+/// little-endian header length, then the header itself.
+///
+/// `load_voice_emb` is called once per voice while a model loads, and the
+/// published checkpoint ships eight of them, so reading whole files here would
+/// double the bytes touched at startup for no reason.
+fn read_safetensors_header(path: &std::path::Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut len_bytes = [0u8; 8];
+    file.read_exact(&mut len_bytes)?;
+    let header_len = u64::from_le_bytes(len_bytes);
+    // A file that is not safetensors can claim an absurd header length; refuse
+    // to allocate on its word.
+    if header_len > 100 * 1024 * 1024 {
+        xn::bail!("{} does not look like a safetensors file", path.display())
+    }
+    let mut buf = len_bytes.to_vec();
+    buf.resize(8 + header_len as usize, 0);
+    file.read_exact(&mut buf[8..])?;
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -176,5 +201,239 @@ mod tests {
         }
         assert!(!is_unused_by_tts_model("flow_lm.transformer.layers.0.linear1.weight"));
         assert!(!is_unused_by_tts_model("mimi.decoder.layers.0.weight"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Where a checkpoint comes from
+// ---------------------------------------------------------------------------
+
+/// Voice embeddings shipped with the published checkpoint.
+pub const VOICES: &[&str] =
+    &["alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma"];
+
+/// Default Hugging Face repo for the published weights.
+pub const DEFAULT_REPO_ID: &str = "kyutai/pocket-tts";
+
+/// Weight file names tried, in order, when the source does not name one.
+pub const WEIGHT_CANDIDATES: &[&str] =
+    &["model.safetensors", "model.q8.gguf", "tts_b6369a24.safetensors"];
+
+/// Tokenizer file names tried, in order. `tokenizer.json` is the Hugging Face
+/// `tokenizers` format, `tokenizer.model` is SentencePiece; [`crate::tok::Tok`]
+/// picks the reader by extension.
+pub const TOKENIZER_CANDIDATES: &[&str] = &["tokenizer.json", "tokenizer.model"];
+
+/// Where to load a checkpoint from.
+///
+/// [`load_weights`] and [`load_voice_emb`] read files that someone has already
+/// located; this decides *which* files, across the three layouts in use — the
+/// published Hub repo, a local model directory, and explicit paths.
+#[derive(Clone, Debug)]
+pub enum ModelSource {
+    /// A Hugging Face model repo. Requires the `hub` feature.
+    Hub { repo_id: String, weights: Option<String> },
+    /// A local directory holding `config.json`, a weights file, a tokenizer and
+    /// an optional `voices/` or `embeddings/` subdirectory.
+    Dir(std::path::PathBuf),
+    /// Explicit file paths. `config` defaults to [`TTSConfig::v202601`] when absent.
+    Files {
+        config: Option<std::path::PathBuf>,
+        weights: std::path::PathBuf,
+        tokenizer: Option<std::path::PathBuf>,
+    },
+}
+
+impl ModelSource {
+    /// The published checkpoint on the Hugging Face Hub.
+    pub fn hub() -> Self {
+        Self::Hub { repo_id: DEFAULT_REPO_ID.to_string(), weights: None }
+    }
+
+    /// A specific Hugging Face repo, with the default weight-file search order.
+    pub fn hub_repo(repo_id: impl Into<String>) -> Self {
+        Self::Hub { repo_id: repo_id.into(), weights: None }
+    }
+
+    /// Locate every file this source provides, downloading if needed, and parse
+    /// the config.
+    pub fn resolve(&self, temperature: f32) -> Result<Artifacts> {
+        match self {
+            Self::Hub { repo_id, weights } => resolve_hub(repo_id, weights.as_deref(), temperature),
+            Self::Dir(dir) => resolve_dir(dir, temperature),
+            Self::Files { config, weights, tokenizer } => {
+                let config = match config {
+                    Some(path) => read_config(path, temperature)?,
+                    None => TTSConfig::v202601(temperature),
+                };
+                if !weights.is_file() {
+                    xn::bail!("weights file not found: {}", weights.display())
+                }
+                Ok(Artifacts {
+                    config,
+                    weights: weights.clone(),
+                    tokenizer: tokenizer.clone(),
+                    voices: vec![],
+                })
+            }
+        }
+    }
+}
+
+/// A checkpoint's files, located and its config parsed, ready to load.
+#[derive(Clone, Debug)]
+pub struct Artifacts {
+    pub config: TTSConfig,
+    pub weights: std::path::PathBuf,
+    /// `None` when the source carries no tokenizer file; the caller must then
+    /// supply a tokenizer itself.
+    pub tokenizer: Option<std::path::PathBuf>,
+    /// Voice name to embedding file, sorted by name.
+    pub voices: Vec<(String, std::path::PathBuf)>,
+}
+
+fn read_config(path: &std::path::Path, temperature: f32) -> Result<TTSConfig> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| xn::Error::msg(format!("cannot read config {}: {e}", path.display())))?;
+    let mut cfg: TTSConfig = serde_json::from_str(&text)
+        .map_err(|e| xn::Error::msg(format!("cannot parse config {}: {e}", path.display())))?;
+    cfg.temp = temperature;
+    Ok(cfg)
+}
+
+fn resolve_dir(dir: &std::path::Path, temperature: f32) -> Result<Artifacts> {
+    if !dir.is_dir() {
+        xn::bail!("not a directory: {}", dir.display())
+    }
+    let config_path = dir.join("config.json");
+    let config = if config_path.is_file() {
+        read_config(&config_path, temperature)?
+    } else {
+        TTSConfig::v202601(temperature)
+    };
+
+    let weights = WEIGHT_CANDIDATES
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+        xn::Error::msg(format!(
+            "no weights file in {}; expected one of {}",
+            dir.display(),
+            WEIGHT_CANDIDATES.join(", ")
+        ))
+    })?;
+
+    let tokenizer =
+        TOKENIZER_CANDIDATES.iter().map(|name| dir.join(name)).find(|path| path.is_file());
+
+    let mut voices = vec![];
+    for sub in ["voices", "embeddings"] {
+        collect_voice_dir(&dir.join(sub), &mut voices);
+    }
+    let default_voice = dir.join("default-voice.safetensors");
+    if default_voice.is_file() {
+        voices.push(("default".to_string(), default_voice));
+    }
+    voices.sort();
+    voices.dedup_by(|a, b| a.0 == b.0);
+
+    Ok(Artifacts { config, weights, tokenizer, voices })
+}
+
+/// Adds every `*.safetensors` file in `dir` to `voices`, keyed by file stem. A
+/// missing or unreadable directory is not an error: voices are optional.
+fn collect_voice_dir(dir: &std::path::Path, voices: &mut Vec<(String, std::path::PathBuf)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("safetensors") {
+            continue;
+        }
+        if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+            voices.push((name.to_string(), path));
+        }
+    }
+}
+
+#[cfg(not(feature = "hub"))]
+fn resolve_hub(_: &str, _: Option<&str>, _: f32) -> Result<Artifacts> {
+    xn::bail!(
+        "loading from the Hugging Face Hub requires the `hub` feature of the `ptts` crate; \
+         use ModelSource::Dir or ModelSource::Files to load local files instead"
+    )
+}
+
+#[cfg(feature = "hub")]
+fn resolve_hub(repo_id: &str, weights: Option<&str>, temperature: f32) -> Result<Artifacts> {
+    let repo = HubRepo::open(repo_id)?;
+
+    let config = match repo.get_optional("config.json") {
+        Some(path) => read_config(&path, temperature)?,
+        None => TTSConfig::v202601(temperature),
+    };
+
+    let weights = match weights {
+        Some(name) => repo.get(name)?,
+        None => match WEIGHT_CANDIDATES.iter().find_map(|name| repo.get_optional(name)) {
+            Some(path) => path,
+            None => xn::bail!(
+                "no weights file in `{repo_id}`; expected one of {}",
+                WEIGHT_CANDIDATES.join(", ")
+            ),
+        },
+    };
+
+    let tokenizer = TOKENIZER_CANDIDATES.iter().find_map(|name| repo.get_optional(name));
+
+    let mut voices = vec![];
+    for voice in VOICES {
+        if let Some(path) = repo.get_optional(&format!("embeddings/{voice}.safetensors")) {
+            voices.push((voice.to_string(), path));
+        }
+    }
+    if let Some(path) = repo.get_optional("default-voice.safetensors") {
+        voices.push(("default".to_string(), path));
+    }
+    voices.sort();
+
+    Ok(Artifacts { config, weights, tokenizer, voices })
+}
+
+/// A Hugging Face model repo, wrapped so a download failure names the repo, the
+/// file and the URL — `hf_hub`'s own errors mention none of the three, which
+/// makes a gated repo or a renamed file hard to diagnose.
+#[cfg(feature = "hub")]
+struct HubRepo {
+    repo: hf_hub::api::sync::ApiRepo,
+    repo_id: String,
+}
+
+#[cfg(feature = "hub")]
+impl HubRepo {
+    fn open(repo_id: &str) -> Result<Self> {
+        use hf_hub::{Repo, RepoType, api::sync::Api};
+        let api = Api::new()
+            .map_err(|e| xn::Error::msg(format!("cannot reach the Hugging Face Hub: {e}")))?;
+        let repo = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
+        Ok(Self { repo, repo_id: repo_id.to_string() })
+    }
+
+    fn get(&self, filename: &str) -> Result<std::path::PathBuf> {
+        self.repo.get(filename).map_err(|e| {
+            let url = self.repo.url(filename);
+            xn::Error::msg(format!(
+                "failed to fetch `{filename}` from `{}` ({url}): {e}\n\
+                 If the repo is gated, accept its terms on huggingface.co and run \
+                 `huggingface-cli login` (or set HF_TOKEN).",
+                self.repo_id
+            ))
+        })
+    }
+
+    /// Like [`Self::get`] but maps any failure to `None`, for files that may
+    /// legitimately be absent from a given repo layout.
+    fn get_optional(&self, filename: &str) -> Option<std::path::PathBuf> {
+        self.repo.get(filename).ok()
     }
 }
