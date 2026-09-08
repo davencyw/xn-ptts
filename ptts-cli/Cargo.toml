@@ -1,0 +1,33 @@
+[package]
+name = "ptts-cli"
+version.workspace = true
+edition = "2024"
+description = "Command-line text-to-speech using Pocket TTS. Installs the `pocket-tts` binary."
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+# The point of this crate is `cargo install ptts-cli`, so keep it a binary only:
+# no library target for anyone to depend on by accident. The crate is `ptts-cli`
+# because crates.io `pocket-tts` belongs to an unrelated project; the binary it
+# installs is still `pocket-tts`, which is what anyone actually types.
+autolib = false
+
+[[bin]]
+name = "pocket-tts"
+path = "src/main.rs"
+
+[dependencies]
+ptts = { workspace = true, features = ["sp", "hub", "audio"] }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+xn = { workspace = true }
+
+[features]
+default = []
+cuda = ["xn/cuda", "ptts/cuda"]
+vulkan = ["xn/vulkan", "ptts/vulkan"]
+metal = ["xn/metal", "ptts/metal"]
+accelerate = ["xn/accelerate", "ptts/accelerate"]

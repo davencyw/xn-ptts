@@ -23,7 +23,9 @@ serde_json = { workspace = true }
 # of the wasm build), and one of `sentencepiece` / `tokenizers` for reading a
 # tokenizer out of a checkpoint.
 hf-hub = { workspace = true, optional = true }
+rubato = { workspace = true, optional = true }
 sentencepiece = { workspace = true, optional = true }
+symphonia = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -51,13 +53,11 @@ sp = ["dep:sentencepiece"]
 hf = ["dep:tokenizers"]
 # Download checkpoints from the Hugging Face Hub (`ModelSource::Hub`).
 hub = ["dep:hf-hub"]
+# Decode and resample audio files (`ptts::audio`), for voice cloning.
+audio = ["dep:symphonia", "dep:rubato"]
 
 [[example]]
 name = "say"
-required-features = ["sp", "hub"]
-
-[[example]]
-name = "pocket_tts"
 required-features = ["sp", "hub"]
 
 [[example]]
@@ -69,3 +69,4 @@ name = "quantize"
 
 [[example]]
 name = "create_voice"
+required-features = ["audio"]

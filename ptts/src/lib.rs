@@ -24,6 +24,7 @@
 //! | [`synth`] | The one-call API: load, prime, generate, decode. Start here. |
 //! | [`loader`] | Locating weights, the published-name mapping, voice files. |
 //! | [`plan`] | Frame and KV budgets, the end-of-speech policy. |
+//! | [`audio`] | Decoding and resampling audio files, for voice cloning (`audio` feature). |
 //! | [`preprocess`] | Per-language text normalization, applied before tokenizing. |
 //! | [`tok`] | Tokenizers, behind the `sp` / `hf` features. |
 //! | [`tts_model`] | [`tts_model::TTSModel`], the streaming primitives `synth` drives. |
@@ -35,6 +36,8 @@
 //! [`tts_model::TTSModel`] directly. `Synth` is a composition of those
 //! primitives, not a replacement for them.
 
+#[cfg(feature = "audio")]
+pub mod audio;
 pub mod conditioners;
 pub mod conv;
 pub mod dummy_quantizer;
