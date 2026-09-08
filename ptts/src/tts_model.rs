@@ -343,12 +343,14 @@ impl<Q: BackendQ> TTSModel<Q> {
     }
 
     /// Initialize mimi streaming state.
-    pub fn init_mimi_state(
-        &self,
-        batch_size: usize,
-        context: usize,
-    ) -> Result<MimiDecoderState<f32, Q::B>> {
-        self.mimi.init_state(batch_size, context)
+    ///
+    /// The decoder transformer's context window is fixed at load time from
+    /// `MimiConfig::transformer_context`; nothing about this state is sized per call, so unlike
+    /// [`Self::init_flow_lm_state`] there is no budget to pass.
+    pub fn init_mimi_state(&self, batch_size: usize) -> Result<MimiDecoderState<f32, Q::B>> {
+        // `sequence_length` reaches only the flow-LM attention kind, which a Mimi decoder has
+        // none of, so any value here is discarded.
+        self.mimi.init_state(batch_size, 0)
     }
 
     fn run_backbone_and_increment(

@@ -1,30 +1,12 @@
 use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArrayDyn, PyUntypedArrayMethods};
+use ptts::flow_lm::NormalRng;
+use ptts::loader::{is_unused_by_tts_model, load_voice_emb, remap_key};
+use ptts::tok::Tok;
 use ptts::tts_model::{MimiEnc, TTSConfig, TTSModel, TTSState};
 use pyo3::prelude::*;
 use std::sync::Arc;
 use xn::nn::VB;
 use xn::{BackendQ, Tensor, Unquantized, error::Context};
-
-struct StdRng {
-    inner: rand::rngs::StdRng,
-    distr: rand_distr::Normal<f32>,
-}
-
-impl StdRng {
-    fn new(temperature: f32, seed: u64) -> Self {
-        use rand::SeedableRng;
-        let distr = rand_distr::Normal::new(0f32, temperature.sqrt()).unwrap();
-        let inner = rand::rngs::StdRng::seed_from_u64(seed);
-        Self { inner, distr }
-    }
-}
-
-impl ptts::flow_lm::Rng for StdRng {
-    fn sample(&mut self) -> f32 {
-        use rand::Rng;
-        self.inner.sample(self.distr)
-    }
-}
 
 trait PyRes<R> {
     fn w(self) -> PyResult<R>;
@@ -185,7 +167,7 @@ impl<Q: BackendQ> ModelB<Q> {
     /// `name`, overwriting any existing voice with the same name.
     fn add_voice(&mut self, name: &str, voice_path: &std::path::Path) -> xn::Result<()> {
         let dev = self.inner.device().clone();
-        let voice_emb = load_voice_embedding(voice_path, &dev)?.to::<Q::T>()?;
+        let voice_emb = load_voice_emb(voice_path, None, &dev)?.to::<Q::T>()?;
         self.voices.insert(name.to_string(), voice_emb);
         Ok(())
     }
@@ -450,8 +432,8 @@ fn run_generate<Q: BackendQ>(
     let device = model.device();
     let num_tokens = tokens.len();
     let max_frames = ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
-    let mut rng = StdRng::new(temperature, seed);
-    let mut mimi_state = model.init_mimi_state(1, 250)?;
+    let mut rng = NormalRng::new(temperature, seed)?;
+    let mut mimi_state = model.init_mimi_state(1)?;
 
     model.prompt_text(&mut state, &tokens)?;
     if let Some((_, cfg_state)) = cfg_state.as_mut() {
@@ -541,8 +523,8 @@ fn run_generate_background<Q: BackendQ>(
     let device = model.device();
     let num_tokens = tokens.len();
     let max_frames = ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
-    let mut rng = StdRng::new(temperature, seed);
-    let mut mimi_state = model.init_mimi_state(1, 250)?;
+    let mut rng = NormalRng::new(temperature, seed)?;
+    let mut mimi_state = model.init_mimi_state(1)?;
 
     model.prompt_text(&mut state, &tokens)?;
     if let Some((_, cfg_state)) = cfg_state.as_mut() {
@@ -845,83 +827,6 @@ impl ModelState {
     }
 }
 
-pub enum Tok {
-    Sp(std::sync::Arc<sentencepiece::SentencePieceProcessor>),
-    Hf(Box<tokenizers::Tokenizer>),
-}
-
-impl From<sentencepiece::SentencePieceProcessor> for Tok {
-    fn from(sp: sentencepiece::SentencePieceProcessor) -> Self {
-        Tok::Sp(std::sync::Arc::new(sp))
-    }
-}
-
-impl From<tokenizers::Tokenizer> for Tok {
-    fn from(tok: tokenizers::Tokenizer) -> Self {
-        Tok::Hf(Box::new(tok))
-    }
-}
-
-impl ptts::Tokenizer for Tok {
-    fn encode(&self, text: &str) -> xn::Result<Vec<u32>> {
-        let tokens = match self {
-            Tok::Sp(sp) => {
-                sp.encode(text).map_err(xn::Error::wrap)?.into_iter().map(|v| v.id).collect()
-            }
-            Tok::Hf(tok) => tok.encode(text, false).map_err(xn::Error::wrap)?.get_ids().to_vec(),
-        };
-        Ok(tokens)
-    }
-
-    fn decode(&self, ids: &[u32]) -> xn::Result<String> {
-        let decoded = match self {
-            Tok::Sp(sp) => sp.decode_piece_ids(ids).map_err(xn::Error::wrap)?,
-            Tok::Hf(tok) => tok.decode(ids, true).map_err(xn::Error::wrap)?,
-        };
-        Ok(decoded)
-    }
-}
-
-fn remap_key(name: &str) -> Option<String> {
-    if name.contains("flow.w_s_t")
-        || name.contains("quantizer.vq")
-        || name.contains("quantizer.logvar_proj")
-    {
-        return None;
-    }
-
-    let mut name = name.to_string();
-    name = name.replace(
-        "flow_lm.condition_provider.conditioners.speaker_wavs.output_proj.weight",
-        "flow_lm.speaker_proj_weight",
-    );
-    name = name.replace(
-        "flow_lm.condition_provider.conditioners.transcript_in_segment.",
-        "flow_lm.conditioner.",
-    );
-    name = name.replace("flow_lm.backbone.", "flow_lm.transformer.");
-    name = name.replace("flow_lm.flow.", "flow_lm.flow_net.");
-    name = name.replace("mimi.model.", "mimi.");
-    Some(name)
-}
-
-fn load_voice_embedding<B: xn::Backend>(
-    voice_path: &std::path::Path,
-    device: &B,
-) -> Result<Tensor<f32, B>, xn::Error> {
-    let voice_vb = VB::load(&[voice_path], device.clone())?;
-    let voice_names = voice_vb.tensor_names();
-    let voice_key = voice_names.first().context("no tensors found in voice embedding file")?;
-    let voice_shape = voice_vb.shape(voice_key).context("voice tensor not found")?;
-    let voice_dims = voice_shape.dims();
-    let voice_emb: Tensor<f32, B> = voice_vb.tensor(voice_key, voice_shape.clone())?;
-    if voice_dims.len() == 2 {
-        Ok(voice_emb.reshape((1, voice_dims[0], voice_dims[1]))?)
-    } else {
-        Ok(voice_emb)
-    }
-}
-
 fn load_model_<Q: BackendQ>(
     temperature: f32,
     repo_id: String,
@@ -985,7 +890,7 @@ fn load_model_<Q: BackendQ>(
             for &voice in POCKET_TTS_VOICES {
                 let voice_file = format!("embeddings/{voice}.safetensors");
                 if let Ok(voice_path) = repo.get(&voice_file)
-                    && let Ok(voice_emb) = load_voice_embedding(&voice_path, &dev)
+                    && let Ok(voice_emb) = load_voice_emb(&voice_path, None, &dev)
                     && let Ok(voice_emb) = voice_emb.to::<Q::T>()
                 {
                     voices.insert(voice.to_string(), voice_emb);
@@ -997,16 +902,7 @@ fn load_model_<Q: BackendQ>(
         }
     };
 
-    let tokenizer_path = tokenizer_path.to_str().context("invalid tokenizer path")?;
-    let tokenizer = if tokenizer_path.ends_with(".model") {
-        let sp = sentencepiece::SentencePieceProcessor::open(tokenizer_path)
-            .map_err(|e| xn::Error::msg(e).with_path(tokenizer_path))?;
-        Tok::Sp(sp.into())
-    } else {
-        let tok = tokenizers::Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| xn::Error::msg(e).with_path(tokenizer_path))?;
-        Tok::Hf(Box::new(tok))
-    };
+    let tokenizer = Tok::open(&tokenizer_path)?;
 
     // GGUF checkpoints carry weights already quantized; safetensors are
     // (re)quantized into `Q` on load.
@@ -1031,10 +927,7 @@ fn load_model_<Q: BackendQ>(
     let enc_probe = format!("{}.encoder.model.0.conv.weight", cfg.speaker_mimi_prefix());
     let mimi_enc =
         if vb.contains(&enc_probe) { Some(MimiEnc::<Q>::load(&vb, &cfg)?) } else { None };
-    vb.check_all_used_with_ignore(|v| {
-        v == "flow_lm.condition_provider.conditioners.speaker_wavs.learnt_padding"
-            || v.starts_with("mimi.quantizer")
-    })?;
+    vb.check_all_used_with_ignore(is_unused_by_tts_model)?;
 
     Ok(ModelB {
         inner: Arc::new(model),

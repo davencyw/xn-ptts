@@ -18,13 +18,14 @@ serde = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 sentencepiece = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+safetensors = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
 half = { workspace = true }
 hf-hub = { workspace = true }
-safetensors = { workspace = true }
 rubato = { workspace = true }
 libc = { workspace = true }
 serde_json = { workspace = true }
@@ -39,6 +40,8 @@ metal = ["xn/metal"]
 webgpu = ["xn/webgpu"]
 accelerate = ["xn/accelerate"]
 sp = ["dep:sentencepiece"]
+# Hugging Face `tokenizers` support in `ptts::tok`.
+hf = ["dep:tokenizers"]
 
 [[example]]
 name = "pocket_tts"

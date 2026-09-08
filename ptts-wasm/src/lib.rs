@@ -12,6 +12,7 @@ macro_rules! console_log {
 }
 
 use ptts::flow_lm::{self, FlowLMState};
+use ptts::loader::remap_key;
 use ptts::mimi::MimiDecoderState;
 use ptts::transformer::{LayerAttentionState, StreamingMHAState, StreamingTransformerState};
 use ptts::tts_model::{TTSConfig, TTSModel, TTSState, prepare_text_prompt};
@@ -77,31 +78,6 @@ impl flow_lm::Rng for WasmRng {
         use rand::Rng;
         self.inner.sample(self.distr)
     }
-}
-
-fn remap_key(name: &str) -> Option<String> {
-    if name.contains("flow.w_s_t")
-        || name.contains("quantizer.vq")
-        || name.contains("quantizer.logvar_proj")
-        || name.contains("learnt_padding")
-    {
-        return None;
-    }
-
-    let mut name = name.to_string();
-    name = name.replace(
-        "flow_lm.condition_provider.conditioners.speaker_wavs.output_proj.weight",
-        "flow_lm.speaker_proj_weight",
-    );
-    name = name.replace(
-        "flow_lm.condition_provider.conditioners.transcript_in_segment.",
-        "flow_lm.conditioner.",
-    );
-    name = name.replace("flow_lm.backbone.", "flow_lm.transformer.");
-    name = name.replace("flow_lm.flow.", "flow_lm.flow_net.");
-    name = name.replace("mimi.model.", "mimi.");
-
-    Some(name)
 }
 
 /// Underlying type-erased transformer state, shared across all supported quantizations
@@ -316,7 +292,7 @@ impl Model {
         console_log!("[start_generation] running prompt_text...");
         let mimi_state = dispatch!(&self.inner, &mut tts_state, |m, s| {
             m.prompt_text(s, token_ids)?;
-            m.init_mimi_state(1, 250)?
+            m.init_mimi_state(1)?
         });
         console_log!("[start_generation] prompt_text done, starting generation loop");
 

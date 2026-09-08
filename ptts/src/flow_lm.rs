@@ -8,6 +8,31 @@ pub trait Rng {
     fn sample(&mut self) -> f32;
 }
 
+/// The [`Rng`] every frontend actually uses: seeded Gaussian noise for the flow-matching
+/// sampler, with standard deviation `sqrt(temperature)`.
+///
+/// Named for the distribution rather than the generator, since it wraps `rand::rngs::StdRng`
+/// and the two are easy to confuse.
+pub struct NormalRng {
+    inner: rand::rngs::StdRng,
+    distr: rand_distr::Normal<f32>,
+}
+
+impl NormalRng {
+    pub fn new(temperature: f32, seed: u64) -> Result<Self> {
+        use rand::SeedableRng;
+        let distr = rand_distr::Normal::new(0f32, temperature.sqrt()).map_err(xn::Error::wrap)?;
+        Ok(Self { inner: rand::rngs::StdRng::seed_from_u64(seed), distr })
+    }
+}
+
+impl Rng for NormalRng {
+    fn sample(&mut self) -> f32 {
+        use rand::Rng as _;
+        self.inner.sample(self.distr)
+    }
+}
+
 /// Lagrangian Self Distillation decode.
 /// Rebuilds the data sample from starting point x_0.
 fn lsd_decode<T: WithDTypeF, B: Backend>(

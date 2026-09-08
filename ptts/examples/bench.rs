@@ -11,12 +11,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use model_helpers::{SpTokenizer, max_frames_for};
+use model_helpers::max_frames_for;
+use ptts::flow_lm::NormalRng;
+use ptts::tok::Tok;
 use ptts::tts_model::{TTSConfig, TTSModel, TTSState};
 use xn::{BackendQ, Tensor};
-
-/// Frames of Mimi decoder context, matching `pocket_tts`.
-const MIMI_CONTEXT_SIZE: usize = 250;
 
 #[derive(Parser, Debug)]
 #[command(name = "bench")]
@@ -75,30 +74,6 @@ struct Args {
     /// Off by default so measurements stay comparable with runs that predate the flag.
     #[arg(long)]
     lang: Option<String>,
-
-    /// Frames of Mimi decoder context -- the vocoder window.
-    #[arg(long, default_value_t = MIMI_CONTEXT_SIZE)]
-    mimi_context: usize,
-}
-
-struct StdRng {
-    inner: rand::rngs::StdRng,
-    distr: rand_distr::Normal<f32>,
-}
-
-impl StdRng {
-    fn new(temperature: f32, seed: u64) -> Result<Self> {
-        use rand::SeedableRng;
-        let distr = rand_distr::Normal::new(0f32, temperature.sqrt())?;
-        Ok(Self { inner: rand::rngs::StdRng::seed_from_u64(seed), distr })
-    }
-}
-
-impl ptts::flow_lm::Rng for StdRng {
-    fn sample(&mut self) -> f32 {
-        use rand::Rng;
-        self.inner.sample(self.distr)
-    }
 }
 
 /// One iteration's timings.
@@ -125,7 +100,7 @@ fn one<Q: BackendQ>(
 ) -> Result<Run> {
     let dev = model.device();
     let ldim = model.flow_lm.ldim;
-    let mut rng = StdRng::new(args.temperature, args.seed)?;
+    let mut rng = NormalRng::new(args.temperature, args.seed)?;
     let mut frames = Vec::new();
     let mut sample_t = Vec::new();
     let mut decode_t = Vec::new();
@@ -136,7 +111,7 @@ fn one<Q: BackendQ>(
     for (tokens, frames_after_eos) in chunks.iter() {
         let mut state = base_state.clone();
         model.prompt_text(&mut state, tokens)?;
-        let mut mimi_state = model.init_mimi_state(1, args.mimi_context)?;
+        let mut mimi_state = model.init_mimi_state(1)?;
 
         // BOS marker: an all-NaN latent.
         let nan: Tensor<f32, Q::B> = Tensor::from_vec(vec![f32::NAN; ldim], (1, 1, ldim), dev)?;
@@ -237,12 +212,13 @@ impl Bench<'_> {
         };
 
         let t_load = Instant::now();
-        let tokenizer = SpTokenizer::open(&tokenizer_path)?;
+        let tokenizer = Tok::open(&tokenizer_path)?;
         let vb = model_helpers::load_weights::<Q>(&args.model, &dev)?;
         let model: TTSModel<Q> = TTSModel::load(&vb, Box::new(tokenizer), &cfg)?;
         vb.check_all_used_with_ignore(model_helpers::is_unused_by_tts_model)?;
         let voice_emb =
-            model_helpers::load_voice_emb::<Q>(&args.voice, cfg.model_ext().as_deref(), &dev)?;
+            model_helpers::load_voice_emb(&args.voice, cfg.model_ext().as_deref(), &dev)?
+                .to::<Q::T>()?;
         let load_ms = ms(t_load.elapsed());
 
         // Tokenize up front: the loop needs the tokens anyway, and the KV cache is sized from
