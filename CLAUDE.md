@@ -37,10 +37,8 @@ cargo run --release --example pocket_tts --features hf -- "hello world" -o out.w
   --tokenizer path/to/tokenizer.json
 ```
 
-It downloads weights from the `kyutai/pocket-tts` HuggingFace repo on first run. That repo ships
-only a SentencePiece `tokenizer.model`, so convert it once (`uv run scripts/convert-tokenizer.py
-<the cached tokenizer.model>`) and pass the result with `--tokenizer`; the flag can be dropped
-once a `tokenizer.json` is hosted alongside the weights. Built-in voice IDs: `alba`, `marius`, `javert`, `jean`, `fantine`, `cosette`, `eponine`, `azelma`. `--voice` also accepts a path to a 10s audio file or a precomputed voice safetensors.
+It downloads weights from the `kyutai/pocket-tts` HuggingFace repo on first run, along with that
+repo's `tokenizer.json` once it hosts one — until then `--tokenizer` supplies it. Built-in voice IDs: `alba`, `marius`, `javert`, `jean`, `fantine`, `cosette`, `eponine`, `azelma`. `--voice` also accepts a path to a 10s audio file or a precomputed voice safetensors.
 
 Benchmark a local model:
 
@@ -83,7 +81,7 @@ The library implements Pocket TTS: text → tokens → flow-matching language mo
 - `pocket_tts` and `bench` examples, `ptts-pyo3` and `ptts-ws-server`: `ptts::tok::Tok` (the `hf` feature), a Hugging Face `tokenizers` wrapper.
 - `ptts-wasm`: the same `ptts::tok::Tok`, built from the `tokenizer.json` the demo fetches and handed to `Model::new`; the browser passes text, not token ids.
 
-There is no SentencePiece dependency: every Rust frontend loads a `tokenizer.json` and nothing else. The published checkpoints ship a SentencePiece `tokenizer.model` instead, so it has to be converted once with `scripts/convert-tokenizer.py`, which emits an equivalent `tokenizer.json` (identical ids, verified against `sentencepiece` as it converts). No tokenizer is bundled or defaulted to — every checkpoint has its own vocabulary, and loading the wrong one yields plausible audio from the wrong ids — so `Tok::open` refuses a `.model` path, and a missing `tokenizer.json` next to one, with a pointer at the script. `pocket_tts --tokenizer <path>` and `bench --tokenizer <path>` point the examples at a converted file; `ptts-pyo3` and `ptts-ws-server` expect `tokenizer.json` in the HF repo or beside the config.
+Every frontend loads a `tokenizer.json` and nothing else, and none is bundled or defaulted to: each checkpoint has its own vocabulary, and loading the wrong one yields plausible audio from the wrong ids, so `Tok::open` refuses to guess. `pocket_tts --tokenizer <path>` and `bench --tokenizer <path>` override where the examples look; otherwise they, `ptts-pyo3` and `ptts-ws-server` all expect `tokenizer.json` in the HF repo or beside the config. A checkpoint that carries only a `tokenizer.model` needs converting once with `scripts/convert-tokenizer.py`, which writes the equivalent json.
 
 Top-level orchestrator is `tts_model::TTSModel<Q>`, generic over a backend-quantization parameter `Q: BackendQ` from `xn`. It owns:
 
