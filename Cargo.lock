@@ -2260,11 +2260,9 @@ dependencies = [
 name = "ptts-pyo3"
 version = "0.2.3"
 dependencies = [
- "hf-hub",
  "numpy",
  "ptts",
  "pyo3",
- "serde_json",
  "xn",
 ]
 

@@ -293,6 +293,43 @@ impl<Q: BackendQ> SynthOf<Q> {
         Ok(())
     }
 
+    /// Register a voice from a conditioning embedding already in memory, laid
+    /// out as `frames` rows of `dim`.
+    ///
+    /// This is the mimi encoder's output — what
+    /// [`Self::add_voice_from_pcm`] computes internally and what the
+    /// `create_voice` example writes to a file. Callers that compute or cache
+    /// embeddings themselves (`ptts-pyo3` hands one over from numpy) use this.
+    ///
+    /// `null_emb`, when given, is the encoding of equal-length silence, which
+    /// CFG needs on models where `cfg_null_audio_empty` is false.
+    pub fn add_voice_from_embedding(
+        &mut self,
+        name: &str,
+        emb: &[f32],
+        frames: usize,
+        dim: usize,
+        null_emb: Option<&[f32]>,
+    ) -> Result<()> {
+        if emb.len() != frames * dim {
+            xn::bail!("embedding has {} values, expected {frames} x {dim}", emb.len());
+        }
+        let dev = self.model.device().clone();
+        let to_tensor = |data: &[f32]| -> Result<Tensor<Q::T, Q::B>> {
+            Tensor::from_vec(data.to_vec(), (1, frames, dim), &dev)?.to::<Q::T>()
+        };
+        let emb = to_tensor(emb)?;
+        let null_emb = match null_emb {
+            None => None,
+            Some(null) if null.len() != frames * dim => {
+                xn::bail!("null embedding has {} values, expected {frames} x {dim}", null.len())
+            }
+            Some(null) => Some(to_tensor(null)?),
+        };
+        self.voices.insert(name.to_string(), Voice { emb, null_emb });
+        Ok(())
+    }
+
     /// Synthesize `text` and return the whole waveform.
     pub fn say(&self, text: &str) -> Result<Vec<f32>> {
         self.say_with(text, &SpeechOptions::default())
@@ -338,12 +375,23 @@ impl<Q: BackendQ> SynthOf<Q> {
     ) -> Result<SpeechStream> {
         let max_tokens_per_chunk =
             opts.max_tokens_per_chunk.unwrap_or(self.defaults.max_tokens_per_chunk);
+        let chunks = self.plan_chunks(text, max_tokens_per_chunk)?;
+        self.spawn(chunks, opts, rng)
+    }
+
+    /// Prime the state and start the two worker threads for an already-planned
+    /// set of chunks. The tail shared by [`Self::stream_with_rng`] and
+    /// [`Self::stream_tokens`].
+    fn spawn(
+        &self,
+        chunks: Vec<ChunkPlan>,
+        opts: &SpeechOptions,
+        rng: Box<dyn crate::flow_lm::Rng + Send>,
+    ) -> Result<SpeechStream> {
         let cfg_coef = match opts.cfg_coef.or(self.defaults.cfg_coef) {
             Some(coef) if coef != 1.0 => Some(coef),
             _ => None,
         };
-
-        let chunks = self.plan_chunks(text, max_tokens_per_chunk)?;
         let seq_budget = chunks.iter().map(|c| c.seq_budget).max().unwrap_or(0);
 
         let voice_name = opts.voice.as_ref().or(self.defaults.voice.as_ref());
@@ -392,6 +440,50 @@ impl<Q: BackendQ> SynthOf<Q> {
             failed: false,
             workers: Some([backbone_handle, decode_handle]),
         })
+    }
+
+    /// Synthesize from tokens the caller produced, skipping this crate's
+    /// tokenization and sentence splitting.
+    ///
+    /// `frames_after_eos` is the tail length
+    /// [`crate::tts_model::prepare_text_prompt`] would have chosen — 3 for a
+    /// very short prompt, 1 otherwise. Callers doing their own chunking should
+    /// call this once per chunk.
+    pub fn stream_tokens(
+        &self,
+        tokens: Vec<u32>,
+        frames_after_eos: usize,
+        opts: &SpeechOptions,
+    ) -> Result<SpeechStream> {
+        if tokens.is_empty() {
+            xn::bail!("nothing to synthesize: no tokens");
+        }
+        let frame_budget = plan::frame_budget(tokens.len(), self.cfg.mimi.frame_rate);
+        let seq_budget = plan::seq_budget(tokens.len(), frame_budget);
+        let chunk = ChunkPlan { tokens, frame_budget, frames_after_eos, seq_budget };
+        let temperature = opts.temperature.unwrap_or(self.defaults.temperature);
+        let seed = opts.seed.unwrap_or(self.defaults.seed);
+        let rng = Box::new(NormalRng::new(temperature, seed)?);
+        self.spawn(vec![chunk], opts, rng)
+    }
+
+    /// As [`Self::stream_tokens`], collected into one waveform.
+    pub fn say_tokens(
+        &self,
+        tokens: Vec<u32>,
+        frames_after_eos: usize,
+        opts: &SpeechOptions,
+    ) -> Result<Vec<f32>> {
+        let mut pcm = Vec::new();
+        for chunk in self.stream_tokens(tokens, frames_after_eos, opts)? {
+            pcm.extend_from_slice(&chunk?);
+        }
+        Ok(pcm)
+    }
+
+    /// Tokenize `text` the way [`Self::say`] would.
+    pub fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        self.model.flow_lm.conditioner.tokenize(text)
     }
 
     /// Split `text` into chunks and work out the budgets for each.
@@ -1019,6 +1111,44 @@ impl Synth {
     /// [`Self::voice_prompt_sample_rate`].
     pub fn add_voice_from_pcm(&mut self, name: &str, pcm: &[f32]) -> Result<()> {
         dispatch!(&mut self.0, |s| s.add_voice_from_pcm(name, pcm))
+    }
+
+    /// Register a voice from a conditioning embedding already in memory, laid
+    /// out as `frames` rows of `dim` — see [`SynthOf::add_voice_from_embedding`].
+    pub fn add_voice_from_embedding(
+        &mut self,
+        name: &str,
+        emb: &[f32],
+        frames: usize,
+        dim: usize,
+        null_emb: Option<&[f32]>,
+    ) -> Result<()> {
+        dispatch!(&mut self.0, |s| s.add_voice_from_embedding(name, emb, frames, dim, null_emb))
+    }
+
+    /// Tokenize `text` the way [`Self::say`] would.
+    pub fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        dispatch!(&self.0, |s| s.tokenize(text))
+    }
+
+    /// Synthesize from tokens the caller produced — see [`SynthOf::stream_tokens`].
+    pub fn stream_tokens(
+        &self,
+        tokens: Vec<u32>,
+        frames_after_eos: usize,
+        opts: &SpeechOptions,
+    ) -> Result<SpeechStream> {
+        dispatch!(&self.0, |s| s.stream_tokens(tokens, frames_after_eos, opts))
+    }
+
+    /// As [`Self::stream_tokens`], collected into one waveform.
+    pub fn say_tokens(
+        &self,
+        tokens: Vec<u32>,
+        frames_after_eos: usize,
+        opts: &SpeechOptions,
+    ) -> Result<Vec<f32>> {
+        dispatch!(&self.0, |s| s.say_tokens(tokens, frames_after_eos, opts))
     }
 
     /// The weight format actually loaded. GPU backends are always unquantized.

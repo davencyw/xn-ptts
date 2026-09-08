@@ -9,16 +9,16 @@ categories.workspace = true
 license.workspace = true
 
 [lib]
-name = "ptts"
+name = "_ptts"
 crate-type = ["cdylib"]
 
 [dependencies]
 xn = { workspace = true }
-ptts = { workspace = true, features = ["sp", "hf"] }
-hf-hub = { workspace = true }
+# `hub` gives `TTS()` its default download path; `sp`/`hf` read the
+# checkpoint's tokenizer.
+ptts = { workspace = true, features = ["sp", "hf", "hub"] }
 numpy = "0.28"
 pyo3 = { version = "0.28", features = ["extension-module"] }
-serde_json = { workspace = true }
 
 [features]
 default = []

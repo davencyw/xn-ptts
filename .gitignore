@@ -25,3 +25,10 @@ tmp/
 *.wav
 .DS_Store
 .claude
+
+# Python build and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
