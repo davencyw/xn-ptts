@@ -1,8 +1,10 @@
 use anyhow::{Context as _, Result};
+use ptts::flow_lm::NormalRng;
+use ptts::loader::{is_unused_by_tts_model, load_voice_emb, load_weights};
+use ptts::tok::Tok;
 use ptts::tts_model::{TTSConfig, TTSModel, TTSState};
 use std::collections::HashMap;
 use std::sync::Arc;
-use xn::nn::VB;
 use xn::{BackendQ, Tensor};
 
 pub const VOICES: &[&str] =
@@ -10,103 +12,6 @@ pub const VOICES: &[&str] =
 
 pub const DEFAULT_REPO_ID: &str = "kyutai/pocket-tts";
 pub const DEFAULT_MODEL_FILE: &str = "tts_b6369a24.safetensors";
-
-pub struct StdRng {
-    inner: rand::rngs::StdRng,
-    distr: rand_distr::Normal<f32>,
-}
-
-impl StdRng {
-    pub fn new(temperature: f32, seed: u64) -> Self {
-        use rand::SeedableRng;
-        let distr = rand_distr::Normal::new(0f32, temperature.sqrt()).unwrap();
-        let inner = rand::rngs::StdRng::seed_from_u64(seed);
-        Self { inner, distr }
-    }
-}
-
-impl ptts::flow_lm::Rng for StdRng {
-    fn sample(&mut self) -> f32 {
-        use rand::Rng;
-        self.inner.sample(self.distr)
-    }
-}
-
-pub enum Tok {
-    Sp(std::sync::Arc<sentencepiece::SentencePieceProcessor>),
-    Hf(Box<tokenizers::Tokenizer>),
-}
-
-impl From<sentencepiece::SentencePieceProcessor> for Tok {
-    fn from(sp: sentencepiece::SentencePieceProcessor) -> Self {
-        Tok::Sp(std::sync::Arc::new(sp))
-    }
-}
-
-impl From<tokenizers::Tokenizer> for Tok {
-    fn from(tok: tokenizers::Tokenizer) -> Self {
-        Tok::Hf(Box::new(tok))
-    }
-}
-
-impl ptts::Tokenizer for Tok {
-    fn encode(&self, text: &str) -> xn::Result<Vec<u32>> {
-        let tokens = match self {
-            Tok::Sp(sp) => {
-                sp.encode(text).map_err(xn::Error::wrap)?.into_iter().map(|v| v.id).collect()
-            }
-            Tok::Hf(tok) => tok.encode(text, false).map_err(xn::Error::wrap)?.get_ids().to_vec(),
-        };
-        Ok(tokens)
-    }
-
-    fn decode(&self, ids: &[u32]) -> xn::Result<String> {
-        let decoded = match self {
-            Tok::Sp(sp) => sp.decode_piece_ids(ids).map_err(xn::Error::wrap)?,
-            Tok::Hf(tok) => tok.decode(ids, true).map_err(xn::Error::wrap)?,
-        };
-        Ok(decoded)
-    }
-}
-
-fn remap_key(name: &str) -> Option<String> {
-    if name.contains("flow.w_s_t")
-        || name.contains("quantizer.vq")
-        || name.contains("quantizer.logvar_proj")
-    {
-        return None;
-    }
-    let mut name = name.to_string();
-    name = name.replace(
-        "flow_lm.condition_provider.conditioners.speaker_wavs.output_proj.weight",
-        "flow_lm.speaker_proj_weight",
-    );
-    name = name.replace(
-        "flow_lm.condition_provider.conditioners.transcript_in_segment.",
-        "flow_lm.conditioner.",
-    );
-    name = name.replace("flow_lm.backbone.", "flow_lm.transformer.");
-    name = name.replace("flow_lm.flow.", "flow_lm.flow_net.");
-    name = name.replace("mimi.model.", "mimi.");
-    Some(name)
-}
-
-fn load_voice_embedding<B: xn::Backend>(
-    voice_path: &std::path::Path,
-    device: &B,
-) -> Result<Tensor<f32, B>> {
-    let voice_vb = VB::load(&[voice_path], device.clone())?;
-    let voice_names = voice_vb.tensor_names();
-    let voice_key = voice_names.first().context("no tensors found in voice embedding file")?;
-    let voice_shape = voice_vb.shape(voice_key).context("voice tensor not found")?;
-    let voice_dims = voice_shape.dims();
-    let voice_emb: Tensor<f32, B> = voice_vb.tensor(voice_key, voice_shape.clone())?;
-    if voice_dims.len() == 2 {
-        Ok(voice_emb.reshape((1, voice_dims[0], voice_dims[1]))?)
-    } else {
-        Ok(voice_emb)
-    }
-}
 
 pub struct AppStateB<Q: BackendQ> {
     pub model: Arc<TTSModel<Q>>,
@@ -161,7 +66,7 @@ impl<Q: BackendQ> LoadedModel<Q> {
         let tokenizer_path = repo.get("tokenizer.model")?;
 
         let mut voices: HashMap<String, Tensor<Q::T, Q::B>> = HashMap::new();
-        let default_voice = load_voice_embedding(&repo.get("default-voice.safetensors")?, dev)
+        let default_voice = load_voice_emb(&repo.get("default-voice.safetensors")?, None, dev)
             .with_context(|| "failed to load default voice embedding")?
             .to::<Q::T>()
             .with_context(|| "failed to convert default voice embedding")?;
@@ -182,7 +87,7 @@ impl<Q: BackendQ> LoadedModel<Q> {
         for &voice in VOICES {
             let voice_file = format!("embeddings/{voice}.safetensors");
             match repo.get(&voice_file) {
-                Ok(voice_path) => match load_voice_embedding(&voice_path, dev) {
+                Ok(voice_path) => match load_voice_emb(&voice_path, None, dev) {
                     Ok(emb) => match emb.to::<Q::T>() {
                         Ok(emb) => {
                             voices.insert(voice.to_string(), emb);
@@ -231,7 +136,7 @@ impl<Q: BackendQ> LoadedModel<Q> {
             }
             let voice_name =
                 voice.file_stem().and_then(|s| s.to_str()).context("invalid voice file name")?;
-            match load_voice_embedding(&voice, dev) {
+            match load_voice_emb(&voice, None, dev) {
                 Ok(emb) => match emb.to::<Q::T>() {
                     Ok(emb) => {
                         voices.insert(voice_name.to_string(), emb);
@@ -281,7 +186,7 @@ fn load_voices_from_dir<Q: BackendQ>(
                 continue;
             }
         };
-        match load_voice_embedding(&path, dev) {
+        match load_voice_emb(&path, None, dev) {
             Ok(emb) => match emb.to::<Q::T>() {
                 Ok(emb) => {
                     voices.insert(voice_name, emb);
@@ -317,35 +222,12 @@ pub fn load_ptts<Q: BackendQ>(
         load_voices_from_dir::<Q>(voice_dir, &dev, &mut m.voices);
         tracing::info!(num_voices = m.voices.len(), "voice embeddings loaded (incl. voice-dir)");
     }
-    let tokenizer_path = m.tokenizer_path.to_str().context("invalid tokenizer path")?;
-    let tokenizer = if tokenizer_path.ends_with(".model") {
-        tracing::info!("loading SentencePiece tokenizer");
-        let sp = sentencepiece::SentencePieceProcessor::open(tokenizer_path)
-            .with_context(|| format!("failed to open tokenizer at {tokenizer_path}"))?;
-        Tok::Sp(sp.into())
-    } else {
-        tracing::info!("loading Hugging Face tokenizer");
-        let tok = tokenizers::Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| anyhow::format_err!("failed to load tokenizer: {e}"))?;
-        Tok::Hf(Box::new(tok))
-    };
+    let tokenizer = Tok::open(&m.tokenizer_path)
+        .with_context(|| format!("failed to open tokenizer at {}", m.tokenizer_path.display()))?;
 
-    let vb = if m.model_path.extension().and_then(|v| v.to_str()) == Some("gguf") {
-        let reader = std::fs::File::open(&m.model_path)?;
-        let reader = std::io::BufReader::new(reader);
-        VB::load_gguf_with_key_map(reader, dev, remap_key)?
-    } else {
-        VB::load_with_key_map(&[&m.model_path], dev, remap_key)?
-    };
-    let vb = vb.root();
+    let vb = load_weights::<Q>(&m.model_path, &dev)?;
     let model: TTSModel<Q> = TTSModel::load(&vb, Box::new(tokenizer), &m.cfg)?;
-    vb.check_all_used_with_ignore(|v| {
-        v == "flow_lm.condition_provider.conditioners.speaker_wavs.learnt_padding"
-            || v.starts_with("mimi.encoder")
-            || v.starts_with("mimi.downsample.")
-            || v == "flow_lm.speaker_proj_weight"
-            || v.starts_with("mimi.quantizer")
-    })?;
+    vb.check_all_used_with_ignore(is_unused_by_tts_model)?;
 
     let sample_rate = model.sample_rate() as u32;
     let frame_size = (sample_rate as f64 / m.cfg.mimi.frame_rate).round() as u32;
@@ -379,8 +261,8 @@ pub fn generate_chunks<Q: BackendQ>(
     let device = model.device();
     let num_tokens = tokens.len();
     let max_frames = ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
-    let mut rng = StdRng::new(temperature, seed);
-    let mut mimi_state = model.init_mimi_state(1, 250)?;
+    let mut rng = NormalRng::new(temperature, seed)?;
+    let mut mimi_state = model.init_mimi_state(1)?;
 
     model.prompt_text(&mut state, &tokens)?;
 

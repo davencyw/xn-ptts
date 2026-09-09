@@ -5,7 +5,9 @@ mod model_helpers;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use model_helpers::{SpTokenizer, max_frames_for};
+use model_helpers::max_frames_for;
+use ptts::flow_lm::NormalRng;
+use ptts::tok::Tok;
 use ptts::tts_model::{
     MimiEnc, TTSConfig, TTSModel, prepare_text_prompt, split_into_best_sentences,
 };
@@ -234,33 +236,40 @@ fn main() -> Result<()> {
         run_cpu(args)?;
     }
 
-    tracing::info!("peak RSS: {:.2} MB", peak_rss_mb());
+    if let Some(rss_mb) = peak_rss_mb() {
+        tracing::info!("peak RSS: {rss_mb:.2} MB");
+    }
 
     Ok(())
 }
 
-fn peak_rss_mb() -> f64 {
+/// Peak resident set size, or `None` on platforms with no `getrusage`.
+#[cfg(unix)]
+fn peak_rss_mb() -> Option<f64> {
     let mut usage = std::mem::MaybeUninit::uninit();
     let maxrss = unsafe {
         libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr());
         usage.assume_init().ru_maxrss as f64
     };
     // ru_maxrss is in bytes on macOS but kilobytes on Linux.
-    if cfg!(target_os = "macos") { maxrss / (1024.0 * 1024.0) } else { maxrss / 1024.0 }
+    Some(if cfg!(target_os = "macos") { maxrss / (1024.0 * 1024.0) } else { maxrss / 1024.0 })
 }
 
+#[cfg(not(unix))]
+fn peak_rss_mb() -> Option<f64> {
+    None
+}
+
+/// Either the library's seeded sampler, or a canned list of values replayed from a file, which
+/// is how a run is made to match a reference trace exactly.
 enum Rng {
-    StdRng { inner: Box<rand::rngs::StdRng>, distr: rand_distr::Normal<f32> },
+    Normal(Box<NormalRng>),
     FromFile { values: Vec<f32>, index: usize },
 }
 
 impl Rng {
     pub fn std_rng(temperature: f32, seed: u64) -> Result<Self> {
-        use rand::SeedableRng;
-        let std = temperature.sqrt();
-        let distr = rand_distr::Normal::new(0f32, std)?;
-        let rng = rand::rngs::StdRng::seed_from_u64(seed);
-        Ok(Self::StdRng { inner: Box::new(rng), distr })
+        Ok(Self::Normal(Box::new(NormalRng::new(temperature, seed)?)))
     }
 
     pub fn from_file(path: &str) -> Result<Self> {
@@ -273,10 +282,7 @@ impl Rng {
 impl ptts::flow_lm::Rng for Rng {
     fn sample(&mut self) -> f32 {
         match self {
-            Self::StdRng { inner, distr } => {
-                use rand::Rng;
-                inner.sample(*distr)
-            }
+            Self::Normal(rng) => rng.sample(),
             Self::FromFile { values, index } => {
                 if *index >= values.len() {
                     *index = 0;
@@ -345,7 +351,7 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
         }
     };
 
-    let tokenizer = SpTokenizer::open(&tokenizer_path)?;
+    let tokenizer = Tok::open(&tokenizer_path)?;
     let text = match args.lang.as_deref() {
         None => std::borrow::Cow::Borrowed(args.text.as_str()),
         Some(lang) => {
@@ -399,7 +405,7 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
             Some((coef, null_state))
         }
     };
-    let mimi_state = model.init_mimi_state(1, 250)?;
+    let mimi_state = model.init_mimi_state(1)?;
 
     // Load voice embedding
     if let Some(voice) = voice {
@@ -408,11 +414,9 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
                 if cfg_state.is_some() {
                     anyhow::bail!("cfg is not supported with pre-computed voice embeddings");
                 }
-                let voice_emb = model_helpers::load_voice_emb::<Q>(
-                    &voice_path,
-                    cfg.model_ext().as_deref(),
-                    &dev,
-                )?;
+                let voice_emb =
+                    model_helpers::load_voice_emb(&voice_path, cfg.model_ext().as_deref(), &dev)?
+                        .to::<Q::T>()?;
                 (voice_emb, None)
             }
             Voice::Audio(path) => {

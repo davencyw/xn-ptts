@@ -3,12 +3,15 @@ pub mod conv;
 pub mod dummy_quantizer;
 pub mod flow_lm;
 pub mod layer_scale;
+pub mod loader;
 pub mod mimi;
 pub mod mlp;
 pub mod preprocess;
 pub mod resample;
 pub mod rope;
 pub mod seanet;
+#[cfg(any(feature = "sp", feature = "hf"))]
+pub mod tok;
 pub mod transformer;
 pub mod tts_model;
 pub mod utils;
