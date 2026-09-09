@@ -97,13 +97,16 @@ pub fn load_voice_emb<B: Backend>(
 /// none is accepted: older voices predate the metadata.
 fn check_model_ext(path: &std::path::Path, model_ext: &str) -> Result<()> {
     let header = read_safetensors_header(path)?;
-    let (_, metadata) =
-        safetensors::SafeTensors::read_metadata(&header).map_err(xn::Error::wrap)?;
-    if let Some(metadata) = metadata.metadata()
-        && let Some(voice_model_ext) = metadata.get("model_ext")
+    // Not `SafeTensors::read_metadata`: it validates that the buffer holds the
+    // tensor data as well as the header, which is exactly what is not read here.
+    let header: serde_json::Value = serde_json::from_slice(&header).map_err(|e| {
+        xn::Error::msg(format!("cannot parse safetensors header of {}: {e}", path.display()))
+    })?;
+    if let Some(voice_model_ext) = header.get("__metadata__").and_then(|m| m.get("model_ext"))
+        && let Some(voice_model_ext) = voice_model_ext.as_str()
     {
         tracing::info!(?voice_model_ext, "voice embedding model_ext from metadata");
-        if voice_model_ext.as_str() != model_ext {
+        if voice_model_ext != model_ext {
             xn::bail!(
                 "voice embedding model_ext '{voice_model_ext}' does not match config model_ext '{model_ext}'"
             )
@@ -112,8 +115,8 @@ fn check_model_ext(path: &std::path::Path, model_ext: &str) -> Result<()> {
     Ok(())
 }
 
-/// Reads just enough of a safetensors file for `read_metadata`: the 8-byte
-/// little-endian header length, then the header itself.
+/// Reads a safetensors file's JSON header: the 8-byte little-endian header
+/// length, then that many bytes.
 ///
 /// `load_voice_emb` is called once per voice while a model loads, and the
 /// published checkpoint ships eight of them, so reading whole files here would
@@ -130,9 +133,8 @@ fn read_safetensors_header(path: &std::path::Path) -> Result<Vec<u8>> {
     if header_len > 100 * 1024 * 1024 {
         xn::bail!("{} does not look like a safetensors file", path.display())
     }
-    let mut buf = len_bytes.to_vec();
-    buf.resize(8 + header_len as usize, 0);
-    file.read_exact(&mut buf[8..])?;
+    let mut buf = vec![0u8; header_len as usize];
+    file.read_exact(&mut buf)?;
     Ok(buf)
 }
 
@@ -184,6 +186,32 @@ mod tests {
             remap_key("flow_lm.flow.layers.0.weight").as_deref(),
             Some("flow_lm.flow_net.layers.0.weight")
         );
+    }
+
+    #[test]
+    fn model_ext_is_read_from_a_header_only_read() {
+        // One f32 of tensor data, so the header alone is not the whole file:
+        // `check_model_ext` must not need the data section to parse the header.
+        let write = |name: &str, header: &str| {
+            let path = std::env::temp_dir().join(name);
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(&0f32.to_le_bytes());
+            std::fs::write(&path, &bytes).unwrap();
+            path
+        };
+        let tensor = r#""emb":{"dtype":"F32","shape":[1,1,1],"data_offsets":[0,4]}"#;
+
+        let matching = write(
+            "ptts-loader-voice-match.safetensors",
+            &format!(r#"{{"__metadata__":{{"model_ext":"abc@1"}},{tensor}}}"#),
+        );
+        check_model_ext(&matching, "abc@1").unwrap();
+        assert!(check_model_ext(&matching, "def@2").is_err());
+
+        // A voice from before the metadata existed is accepted as-is.
+        let bare = write("ptts-loader-voice-bare.safetensors", &format!(r#"{{{tensor}}}"#));
+        check_model_ext(&bare, "abc@1").unwrap();
     }
 
     #[test]
